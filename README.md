@@ -30,9 +30,10 @@ Real-time terminal dashboard that combines live Binance order flow with Polymark
 ### Important notes:
 
 Windows Defender / SmartScreen may show a warning
-- Click More info - Run anyway
-If your antivirus blocks the file completely - add an exception for it
-The program requires internet access to connect to Binance and Polymarket WebSockets
+- Click More info 
+- Run anyway
+- If your antivirus blocks the file completely - add an exception for it
+- The program requires internet access to connect to Binance and Polymarket WebSockets
 
 ## Advanced
 
