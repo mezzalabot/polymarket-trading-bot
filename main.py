@@ -26,8 +26,15 @@ from src import feeds
 import dashboard
 
 from dotenv import load_dotenv
-from telegram_notifier import send_strong_signal, send_trend_change, shutdown_notifier, send_message
-from real_trading import RealTrader, calculate_trend_direction, get_market_filters
+from telegram_notifier import (
+    send_strong_signal,
+    send_trend_change,
+    send_signal_alert,
+    send_trade_alert,
+    shutdown_notifier,
+    send_message,
+)
+from real_trading import RealTrader, calculate_trend_direction
 
 from paper_trading import PaperTrader  # keep for now as fallback
 
@@ -49,7 +56,7 @@ class DashboardState:
         self.last_direction = {}
         self.last_strong_notify = {}
         self.last_change_notify = {}
-        self.last_neutral_notify = {}
+        self.last_monitor_notify = {}
 
     def should_notify_strong(self, symbol: str, tf: str):
         key = f"{symbol}_{tf}"
@@ -61,16 +68,16 @@ class DashboardState:
         key = f"{symbol}_{tf}"
         self.last_strong_notify[key] = asyncio.get_event_loop().time()
 
-    def should_notify_neutral(self, symbol: str, tf: str):
-        """Check if we should send neutral status update (every 3 min)."""
+    def should_notify_monitor(self, symbol: str, tf: str):
+        """Send monitoring heartbeat every 3 minutes."""
         key = f"{symbol}_{tf}"
         now = asyncio.get_event_loop().time()
-        last = self.last_neutral_notify.get(key, 0)
-        return now - last > 180  # 3 minutes
+        last = self.last_monitor_notify.get(key, 0)
+        return now - last > 180
 
-    def update_neutral_notify(self, symbol: str, tf: str):
+    def update_monitor_notify(self, symbol: str, tf: str):
         key = f"{symbol}_{tf}"
-        self.last_neutral_notify[key] = asyncio.get_event_loop().time()
+        self.last_monitor_notify[key] = asyncio.get_event_loop().time()
 
     def check_trend_change(self, symbol: str, tf: str, new_direction: str, score: float):
         key = f"{symbol}_{tf}"
@@ -149,9 +156,8 @@ def _build_candle_round(now_et: datetime):
     end_hour = candle_end.strftime('%I:%M').lstrip('0')
     ampm = candle_start.strftime('%p')
     candle_round = f"{start_hour}-{end_hour}_{ampm}"
-    candle_index = int(candle_start.timestamp() // (15 * 60))
     time_left = 15 - (current_minute % 15)
-    return candle_round, start_hour, end_hour, ampm, time_left, candle_index
+    return candle_round, start_hour, end_hour, ampm, time_left
 
 
 async def position_monitor_loop(state: feeds.State, coin: str, tf: str, interval: float = 2.0):
@@ -160,25 +166,12 @@ async def position_monitor_loop(state: feeds.State, coin: str, tf: str, interval
 
     while True:
         try:
-            candle_index = int(datetime.now(timezone.utc).timestamp() // (15 * 60))
             if hasattr(paper_trader, 'check_sl_tp'):
-                sltp_trade = await paper_trader.check_sl_tp(
+                await paper_trader.check_sl_tp(
                     symbol_key,
                     state.pm_up or 0,
                     state.pm_dn or 0,
-                    candle_index=candle_index,
                 )
-            else:
-                sltp_trade = None
-
-            if sltp_trade and TELEGRAM_ENABLED:
-                try:
-                    alert_text = paper_trader.format_trade_alert(sltp_trade)
-                    await send_message(alert_text)
-                    reason = sltp_trade.get('reason', 'CLOSE')
-                    print(f"[SL/TP NOTIFICATION] {reason} for {sltp_trade.get('side')} - SENT", flush=True)
-                except Exception as e:
-                    print(f"[ERROR] SL/TP notification failed: {e}", flush=True)
         except Exception as e:
             print(f"[ERROR] Position monitor failed: {e}", flush=True)
 
@@ -218,12 +211,6 @@ async def display_loop(state: feeds.State, trend_state: feeds.State, coin: str, 
                 except Exception as e:
                     print(f"[ERROR] HTF trend calculation failed: {e}", flush=True)
 
-                market_filters = {"ema_spread_pct": None, "atr_pct": None, "filter_ok": True, "reason": "OK"}
-                try:
-                    market_filters = get_market_filters(state.klines or [])
-                except Exception as e:
-                    print(f"[ERROR] Market filter calculation failed: {e}", flush=True)
-
                 try:
                     old_dir = dash_state.check_trend_change(coin, tf, direction, score)
                     if old_dir and TELEGRAM_ENABLED:
@@ -240,9 +227,9 @@ async def display_loop(state: feeds.State, trend_state: feeds.State, coin: str, 
                 et_offset = timedelta(hours=-4)
                 et_tz = timezone(et_offset)
                 now_et = datetime.now(et_tz)
-                candle_round, start_hour, end_hour, ampm, time_left, candle_index = _build_candle_round(now_et)
+                candle_round, start_hour, end_hour, ampm, time_left = _build_candle_round(now_et)
 
-                if direction == "NEUTRAL" and dash_state.should_notify_neutral(coin, tf) and TELEGRAM_ENABLED:
+                if dash_state.should_notify_monitor(coin, tf) and TELEGRAM_ENABLED:
                     try:
                         status = paper_trader.get_status()
                         if state.pm_up is None:
@@ -281,11 +268,6 @@ async def display_loop(state: feeds.State, trend_state: feeds.State, coin: str, 
                                 f"🛑 SL: {pos_sl:.4f} | 🎯 TP: {pos_tp:.4f}\n"
                             )
 
-                        ema_spread = market_filters.get('ema_spread_pct')
-                        atr_pct = market_filters.get('atr_pct')
-                        ema_line = f"🪄 EMA Spread: {ema_spread:.3f}%\n" if ema_spread is not None else "🪄 EMA Spread: n/a\n"
-                        atr_line = f"🌊 ATR: {atr_pct:.3f}%\n" if atr_pct is not None else "🌊 ATR: n/a\n"
-
                         await send_message(
                             f"👀 <b>MONITORING - Bitcoin {tf.upper()}</b>\n\n"
                             f"📅 {date_str} | ⏰ {start_hour} - {end_hour} {ampm} ET\n\n"
@@ -294,14 +276,12 @@ async def display_loop(state: feeds.State, trend_state: feeds.State, coin: str, 
                             f"📉 Polymarket DOWN: {pm_dn_str}\n"
                             f"🎯 Direction: {direction} (Score: {score})\n"
                             f"🧭 HTF Trend: {trend_direction}\n"
-                            f"{ema_line}"
-                            f"{atr_line}"
                             f"⏱️ Time Left: {time_left} min"
                             f"{position_info}\n"
                             f"💰 Balance: ${status['balance']:.2f} | Trades: {status['trades_today']}/100 | PnL: ${status['total_pnl']:.2f}\n"
                             f"🤖 Bot: RUNNING | ⏰ {current_time} ET"
                         )
-                        dash_state.update_neutral_notify(coin, tf)
+                        dash_state.update_monitor_notify(coin, tf)
                     except Exception as e:
                         print(f"[ERROR] Neutral notification failed: {e}", flush=True)
 
@@ -316,8 +296,6 @@ async def display_loop(state: feeds.State, trend_state: feeds.State, coin: str, 
                         state.pm_up_id,
                         state.pm_dn_id,
                         trend_direction,
-                        signal_klines=state.klines,
-                        candle_index=candle_index,
                     )
                     if trade:
                         trade_executed = True
@@ -327,74 +305,29 @@ async def display_loop(state: feeds.State, trend_state: feeds.State, coin: str, 
 
                 if trade_executed and trade and TELEGRAM_ENABLED:
                     try:
-                        emoji = "🚀" if score >= 75 else "🔻"
-                        conf_text = "✅ SWEET SPOT" if 75 <= score <= 80 else "⚠️ FILTERED"
+                        await send_signal_alert(
+                            symbol=coin.upper(),
+                            timeframe=tf,
+                            side=trade.get('side', direction),
+                            score=trade.get('score', score),
+                            trend_direction=trade.get('trend_direction', trend_direction),
+                            price=trade.get('price', 0.0),
+                            candle_round=candle_round,
+                        )
 
-                        signal_text = f"""{emoji} <b>SIGNAL ENTRY - EXECUTED</b> {emoji}
-
-📊 Symbol: <code>{coin.upper()}</code>
-⏱️ Timeframe: {tf}
-📈 Direction: <b>{direction}</b>
-🧭 HTF Trend: <b>{trend_direction}</b>
-🎲 Score: {score}/100
-{conf_text}
-
-⚡ Trade Executed Successfully
-⏰ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ET"""
-
-                        await send_message(signal_text)
-
-                        if trade and trade.get('side') and trade.get('price'):
-                            try:
-                                if hasattr(paper_trader, 'format_trade_alert'):
-                                    alert_text = paper_trader.format_trade_alert(trade)
-                                else:
-                                    emoji = "🟢" if trade['side'] == 'UP' else "🔴"
-                                    sl_pct = trade.get('sl_pct', 15)
-                                    tp_pct = trade.get('tp_pct', 30)
-                                    entry = trade['price']
-                                    sl_price = entry * (1 - sl_pct / 100)
-                                    tp_price = entry * (1 + tp_pct / 100)
-                                    conf = "✅ SWEET SPOT" if 75 <= trade.get('score', 75) <= 80 else "⚠️ FILTERED"
-
-                                    alert_text = f"""{emoji} <b>{trade.get('mode', 'DRY-RUN')} TRADE - OPEN</b> {emoji}
-
-📊 Symbol: <code>{trade['symbol']}</code>
-📥 OPEN: <b>{trade['side']}</b> token
-💵 Price: {trade['price']:.4f}
-📏 Size: {trade['size']:.2f}
-💸 Cost: ${trade.get('cost', 5.0):.2f}
-
-{conf} (Score: {trade.get('score', 75)})
-🛑 SL: {sl_price:.4f} ({sl_pct:.0f}%)
-🎯 TP: {tp_price:.4f} ({tp_pct:.0f}%)
-📊 RR: 1:{tp_pct/sl_pct:.1f}
-🧭 HTF Trend: {trade.get('trend_direction', trend_direction)}
-
-💰 Balance: ${trade['balance_after']:.2f}
-⏰ {trade['timestamp'][:19]} ET"""
-                            except Exception as e:
-                                print(f"[ERROR] Format trade alert failed: {e}", flush=True)
-                                alert_text = f"REAL TRADE: {trade.get('side')} {trade.get('action')} @ {trade.get('price',0):.4f}"
-
-                            await send_message(alert_text)
+                        await send_trade_alert(trade)
 
                         dash_state.update_strong_notify(coin, tf)
-                        print(f"[NOTIFY SENT] Signal + Trade for {direction} {score} | HTF={trend_direction}", flush=True)
+                        print(f"[NOTIFY SENT] Valid signal + entry alert for {trade.get('side')} | score={trade.get('score', score)}", flush=True)
                     except Exception as e:
                         print(f"[ERROR] Notification failed: {e}", flush=True)
 
                 try:
                     now = datetime.now().strftime("%H:%M:%S")
                     status = paper_trader.get_status()
-                    ema_spread = market_filters.get('ema_spread_pct')
-                    atr_pct = market_filters.get('atr_pct')
-                    ema_text = f"{ema_spread:.3f}%" if ema_spread is not None else "n/a"
-                    atr_text = f"{atr_pct:.3f}%" if atr_pct is not None else "n/a"
                     print(
                         f"[{now}] BTC={state.mid:,.0f} | Score={score:.0f} | {direction} | "
-                        f"HTF={trend_direction} | EMA={ema_text} | ATR={atr_text} | "
-                        f"Trades={status['total_trades']} | PnL=${status['total_pnl']:.2f}",
+                        f"HTF={trend_direction} | Trades={status['total_trades']} | PnL=${status['total_pnl']:.2f}",
                         flush=True,
                     )
                 except Exception as e:
