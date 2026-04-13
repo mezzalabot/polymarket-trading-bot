@@ -207,12 +207,21 @@ def fetch_pm_tokens(coin: str, tf: str) -> tuple:
         return None, None
 
 
-async def pm_feed(state: State):
+async def pm_feed(state: State, coin: str = "BTC", tf: str = "15m"):
+    """Polymarket WebSocket feed with auto re-fetch for new rounds."""
+    
+    # Initial token fetch
     if not state.pm_up_id:
-        print("  [PM] no tokens for this coin/timeframe – skipped")
-        return
-
+        state.pm_up_id, state.pm_dn_id = fetch_pm_tokens(coin, tf)
+        if not state.pm_up_id:
+            print("  [PM] no tokens for this coin/timeframe – skipped")
+            return
+    
     assets = [state.pm_up_id, state.pm_dn_id]
+    print(f"  [PM] Connecting with assets: {assets[:20]}...")
+    
+    last_token_refresh = time.time()
+    invalid_price_count = 0
 
     while True:
         try:
@@ -223,11 +232,16 @@ async def pm_feed(state: State):
                 close_timeout=10
             ) as ws:
                 await ws.send(json.dumps({"assets_ids": assets, "type": "market"}))
-                print("  [PM] connected")
+                print("  [PM] WebSocket connected, waiting for prices...")
 
                 while True:
                     try:
                         raw = json.loads(await ws.recv())
+                        # Reduced spam - only log important events, not every price tick
+                        if isinstance(raw, dict) and raw.get("event_type") == "price_change":
+                            pass  # silent for price changes
+                        else:
+                            print(f"  [PM] Received data: {str(raw)[:80]}...")
 
                         if isinstance(raw, list):
                             for entry in raw:
@@ -237,6 +251,26 @@ async def pm_feed(state: State):
                             for ch in raw.get("price_changes", []):
                                 if ch.get("best_ask"):
                                     _pm_set(ch["asset_id"], float(ch["best_ask"]), state)
+                        
+                        # Check if we need to refresh tokens (new round started)
+                        # Invalid prices (0, 1, or None) indicate round change
+                        if state.pm_up in [None, 0.0, 1.0] or state.pm_dn in [None, 0.0, 1.0]:
+                            invalid_price_count += 1
+                            if invalid_price_count >= 5:  # After 5 consecutive invalid messages
+                                elapsed = time.time() - last_token_refresh
+                                if elapsed > 60:  # Wait at least 60s before refreshing
+                                    print(f"  [PM] Prices invalid for {invalid_price_count} messages, refreshing tokens...")
+                                    new_up, new_dn = fetch_pm_tokens(coin, tf)
+                                    if new_up and new_up != state.pm_up_id:
+                                        print(f"  [PM] New round detected! Updating token IDs...")
+                                        state.pm_up_id = new_up
+                                        state.pm_dn_id = new_dn
+                                        assets = [new_up, new_dn]
+                                        last_token_refresh = time.time()
+                                        invalid_price_count = 0
+                                        break  # Break inner loop to reconnect with new tokens
+                        else:
+                            invalid_price_count = 0  # Reset counter when prices valid
 
                     except websockets.exceptions.ConnectionClosed:
                         print("  [PM] connection closed, reconnecting...")

@@ -6,3 +6,5 @@ websockets>=16.0
 rich>=14.3.4
 aiogram>=3.13,<4
 python-dotenv>=1.0
+polymarket>=0.3.0
+web3>=6.0.0

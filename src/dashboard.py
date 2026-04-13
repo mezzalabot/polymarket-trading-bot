@@ -36,6 +36,20 @@ def _col(val):
 TREND_THRESH = 3
 
 
+def calculate_trend_score(st):
+    """Calculate trend score (0-100 scale) for bot notifications.
+    Returns score where:
+    - 0-40 = Bearish
+    - 45-55 = Neutral  
+    - 60-100 = Bullish
+    """
+    score_val, label, _ = _score_trend(st)
+    # Convert from -10..+10 range to 0..100 range
+    # _score_trend returns: bullish >=3, bearish <=-3, neutral in between
+    # Map: -10 → 0, 0 → 50, +10 → 100
+    return 50 + (score_val * 5)
+
+
 def _score_trend(st):
     score = 0
 
