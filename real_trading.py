@@ -42,43 +42,15 @@ def _env_bool(name: str, default: bool = False) -> bool:
     return value.strip().lower() in {"1", "true", "yes", "on"}
 
 
-def _env_int(name: str, default: int) -> int:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _env_float(name: str, default: float) -> float:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
-
-
 # Strategy switches (data-driven defaults from 2026-04-13 review)
 ENABLE_UP_ENTRIES = _env_bool("ENABLE_UP_ENTRIES", True)
 ENABLE_DOWN_ENTRIES = _env_bool("ENABLE_DOWN_ENTRIES", False)
-UP_SCORE_MIN = _env_float("UP_SCORE_MIN", 75.0)
-UP_SCORE_MAX = _env_float("UP_SCORE_MAX", 80.0)
-DOWN_SCORE_MIN = _env_float("DOWN_SCORE_MIN", 0.0)
-DOWN_SCORE_MAX = _env_float("DOWN_SCORE_MAX", 25.0)
+UP_SCORE_MIN = float(os.getenv("UP_SCORE_MIN", "75"))
+UP_SCORE_MAX = float(os.getenv("UP_SCORE_MAX", "80"))
+DOWN_SCORE_MIN = float(os.getenv("DOWN_SCORE_MIN", "0"))
+DOWN_SCORE_MAX = float(os.getenv("DOWN_SCORE_MAX", "25"))
 ALLOW_NEUTRAL_TREND = _env_bool("ALLOW_NEUTRAL_TREND", False)
 KEEP_POSITION_OPEN_ON_FAILED_LIVE_CLOSE = _env_bool("KEEP_POSITION_OPEN_ON_FAILED_LIVE_CLOSE", True)
-
-# Entry quality filters for dry-run validation
-REQUIRE_SIGNAL_CONFIRMATION = _env_bool("REQUIRE_SIGNAL_CONFIRMATION", True)
-SIGNAL_CONFIRMATION_COUNT = max(1, _env_int("SIGNAL_CONFIRMATION_COUNT", 2))
-ENABLE_CHOP_FILTER = _env_bool("ENABLE_CHOP_FILTER", True)
-MIN_EMA_SPREAD_PCT = _env_float("MIN_EMA_SPREAD_PCT", 0.10)
-MIN_ATR_PCT = _env_float("MIN_ATR_PCT", 0.12)
-COOLDOWN_AFTER_SL_CANDLES = max(0, _env_int("COOLDOWN_AFTER_SL_CANDLES", 1))
 
 def get_price_limits(score: float):
     """Static price limits for the current expectancy-optimized setup.
@@ -183,106 +155,6 @@ def check_trend_filter(side: str, trend_direction: str, klines: list = None) -> 
 
     return False, f"SKIP {side} - Unknown trend state: {trend_direction}"
 
-def _extract_closes(klines: list) -> list[float]:
-    closes = []
-    for candle in klines or []:
-        try:
-            closes.append(float(candle["c"]))
-        except (KeyError, TypeError, ValueError):
-            continue
-    return closes
-
-
-def _extract_hlc(klines: list) -> tuple[list[float], list[float], list[float]]:
-    highs, lows, closes = [], [], []
-    for candle in klines or []:
-        try:
-            highs.append(float(candle["h"]))
-            lows.append(float(candle["l"]))
-            closes.append(float(candle["c"]))
-        except (KeyError, TypeError, ValueError):
-            continue
-    return highs, lows, closes
-
-
-def _ema(values: list[float], period: int) -> Optional[float]:
-    if len(values) < period:
-        return None
-    alpha = 2 / (period + 1)
-    ema_value = values[0]
-    for value in values[1:]:
-        ema_value = alpha * value + (1 - alpha) * ema_value
-    return ema_value
-
-
-def _atr_pct(klines: list, period: int = 14) -> Optional[float]:
-    highs, lows, closes = _extract_hlc(klines)
-    if len(closes) < period + 1:
-        return None
-    true_ranges = []
-    for i in range(1, len(closes)):
-        tr = max(
-            highs[i] - lows[i],
-            abs(highs[i] - closes[i - 1]),
-            abs(lows[i] - closes[i - 1]),
-        )
-        true_ranges.append(tr)
-    recent_tr = true_ranges[-period:]
-    if not recent_tr:
-        return None
-    avg_tr = sum(recent_tr) / len(recent_tr)
-    last_close = closes[-1]
-    if not last_close:
-        return None
-    return (avg_tr / last_close) * 100
-
-
-def get_market_filters(klines: list) -> dict[str, Any]:
-    closes = _extract_closes(klines)
-    result: dict[str, Any] = {
-        "ema_spread_pct": None,
-        "atr_pct": None,
-        "filter_ok": True,
-        "reason": "OK",
-    }
-    if len(closes) < 50:
-        result["filter_ok"] = False
-        result["reason"] = "Not enough klines for chop filter"
-        return result
-
-    ema20 = _ema(closes[-80:], 20)
-    ema50 = _ema(closes[-120:], 50)
-    atr_pct = _atr_pct(klines, period=14)
-    last_close = closes[-1]
-
-    ema_spread_pct = None
-    if ema20 is not None and ema50 is not None and last_close:
-        ema_spread_pct = abs(ema20 - ema50) / last_close * 100
-
-    result["ema_spread_pct"] = ema_spread_pct
-    result["atr_pct"] = atr_pct
-
-    if not ENABLE_CHOP_FILTER:
-        return result
-
-    if ema_spread_pct is None or atr_pct is None:
-        result["filter_ok"] = False
-        result["reason"] = "Missing EMA/ATR metrics"
-        return result
-
-    if ema_spread_pct < MIN_EMA_SPREAD_PCT:
-        result["filter_ok"] = False
-        result["reason"] = f"EMA spread too tight ({ema_spread_pct:.3f}% < {MIN_EMA_SPREAD_PCT:.3f}%)"
-        return result
-
-    if atr_pct < MIN_ATR_PCT:
-        result["filter_ok"] = False
-        result["reason"] = f"ATR too low ({atr_pct:.3f}% < {MIN_ATR_PCT:.3f}%)"
-        return result
-
-    return result
-
-
 class RealTrader:
     def __init__(self, data_dir: str = "~/polymarket-bot/real_data"):
         self.data_dir = os.path.expanduser(data_dir)
@@ -310,9 +182,6 @@ class RealTrader:
         
         # Track entry round to prevent multiple entries in same candle
         self.last_entry_round: Optional[str] = None
-        self.pending_signals: Dict[str, Dict[str, Any]] = {}
-        self.cooldown_until_index: Dict[str, int] = {}
-        self.last_stop_loss_reason: Dict[str, Any] = {}
         
         self._load_state()
         
@@ -339,9 +208,6 @@ class RealTrader:
                 self.positions = state.get('positions', {})  # Load positions
                 self.last_entry_round = state.get('last_entry_round', None)
                 self.trade_history = state.get('trade_history', [])  # Load trade history
-                self.pending_signals = state.get('pending_signals', {})
-                self.cooldown_until_index = state.get('cooldown_until_index', {})
-                self.last_stop_loss_reason = state.get('last_stop_loss_reason', {})
                 if self.positions:
                     print(f"[STATE LOADED] Loaded {len(self.positions)} position(s): {list(self.positions.keys())}", flush=True)
     
@@ -358,10 +224,7 @@ class RealTrader:
             'losses': self.losses,
             'positions': self.positions,  # Save positions to persist
             'last_entry_round': self.last_entry_round,
-            'trade_history': self.trade_history,  # Save trade history
-            'pending_signals': self.pending_signals,
-            'cooldown_until_index': self.cooldown_until_index,
-            'last_stop_loss_reason': self.last_stop_loss_reason,
+            'trade_history': self.trade_history  # Save trade history
         }
         with open(self.state_file, 'w') as f:
             json.dump(state, f, indent=2)
@@ -406,75 +269,6 @@ class RealTrader:
             print(f"[TREND GET ERROR] {e}", flush=True)
             return "NEUTRAL"
     
-    def _is_in_cooldown(self, symbol: str, candle_index: Optional[int]) -> tuple[bool, str]:
-        if candle_index is None:
-            return False, ""
-        cooldown_until = self.cooldown_until_index.get(symbol)
-        if cooldown_until is None:
-            return False, ""
-        if candle_index < cooldown_until:
-            remaining = cooldown_until - candle_index
-            return True, f"Cooldown active after SL ({remaining} candle(s) remaining)"
-        return False, ""
-
-    def _register_signal_confirmation(
-        self,
-        symbol: str,
-        side: str,
-        candle_index: Optional[int],
-        score: float,
-        price: float,
-        trend_direction: str,
-    ) -> tuple[bool, str]:
-        if not REQUIRE_SIGNAL_CONFIRMATION:
-            return True, "Signal confirmation disabled"
-
-        bucket = self.pending_signals.get(symbol, {})
-        signal_key = f"{side}|{trend_direction}|{int(score)}"
-
-        if bucket.get('signal_key') == signal_key and bucket.get('candle_index') == candle_index:
-            bucket['count'] = int(bucket.get('count', 0)) + 1
-        else:
-            bucket = {
-                'signal_key': signal_key,
-                'side': side,
-                'score': score,
-                'price': price,
-                'trend_direction': trend_direction,
-                'candle_index': candle_index,
-                'count': 1,
-                'updated_at': datetime.now().isoformat(),
-            }
-
-        self.pending_signals[symbol] = bucket
-        self._save_state()
-
-        count = int(bucket.get('count', 0))
-        if count < SIGNAL_CONFIRMATION_COUNT:
-            return False, f"Waiting confirmation {count}/{SIGNAL_CONFIRMATION_COUNT}"
-
-        self.pending_signals.pop(symbol, None)
-        return True, f"Confirmed {count}/{SIGNAL_CONFIRMATION_COUNT}"
-
-    def _update_position_excursions(self, symbol: str, current_price: float) -> None:
-        pos = self.positions.get(symbol)
-        if not pos or current_price <= 0:
-            return
-        entry_price = float(pos.get('entry_price', 0))
-        if entry_price <= 0:
-            return
-
-        side = pos.get('side')
-        pnl_pct = ((current_price - entry_price) / entry_price) * 100
-        if side == 'DOWN':
-            pnl_pct = -pnl_pct
-
-        mfe_pct = max(float(pos.get('mfe_pct', 0.0)), pnl_pct)
-        mae_pct = min(float(pos.get('mae_pct', 0.0)), pnl_pct)
-        pos['mfe_pct'] = mfe_pct
-        pos['mae_pct'] = mae_pct
-        pos['last_price'] = current_price
-
     async def check_signal(
         self,
         symbol: str,
@@ -485,8 +279,6 @@ class RealTrader:
         pm_up_token_id: Optional[str] = None,
         pm_down_token_id: Optional[str] = None,
         trend_direction: Optional[str] = None,
-        signal_klines: Optional[list] = None,
-        candle_index: Optional[int] = None,
     ):
         # Gunakan lock untuk mencegah race condition (multiple entries)
         global _trade_lock
@@ -510,16 +302,6 @@ class RealTrader:
             # Check if already entered this round (1 entry per round max)
             if candle_round and self.last_entry_round == candle_round:
                 print(f"[SKIP] Already entered round {candle_round} - Blocking new entry!", flush=True)
-                return None
-
-            in_cooldown, cooldown_reason = self._is_in_cooldown(symbol, candle_index)
-            if in_cooldown:
-                print(f"[COOLDOWN] {cooldown_reason}", flush=True)
-                return None
-
-            market_filters = get_market_filters(signal_klines or [])
-            if not market_filters.get('filter_ok', True):
-                print(f"[CHOP FILTER] {market_filters.get('reason')}", flush=True)
                 return None
 
             max_up, min_down, min_entry, max_down = get_price_limits(score)
@@ -556,13 +338,7 @@ class RealTrader:
                     print(f"[TREND FILTER] {trend_reason}", flush=True)
                     return None
 
-                confirm_ok, confirm_reason = self._register_signal_confirmation(
-                    symbol, "UP", candle_index, score, pm_up_price, trend_direction
-                )
-                print(f"[TREND CONFIRM] {trend_reason} | [ENTRY CONFIRM] {confirm_reason}", flush=True)
-                if not confirm_ok:
-                    return None
-
+                print(f"[TREND CONFIRM] {trend_reason}", flush=True)
                 return await self._execute_real_trade(
                     symbol,
                     "UP",
@@ -571,8 +347,6 @@ class RealTrader:
                     candle_round=candle_round,
                     token_id=pm_up_token_id,
                     trend_direction=trend_direction,
-                    filter_snapshot=market_filters,
-                    candle_index=candle_index,
                 )
 
             if down_score_ok and pm_down_price >= min_entry and pm_down_price <= max_down and pm_down_price >= min_down:
@@ -586,13 +360,7 @@ class RealTrader:
                     print(f"[TREND FILTER] {trend_reason}", flush=True)
                     return None
 
-                confirm_ok, confirm_reason = self._register_signal_confirmation(
-                    symbol, "DOWN", candle_index, score, pm_down_price, trend_direction
-                )
-                print(f"[TREND CONFIRM] {trend_reason} | [ENTRY CONFIRM] {confirm_reason}", flush=True)
-                if not confirm_ok:
-                    return None
-
+                print(f"[TREND CONFIRM] {trend_reason}", flush=True)
                 return await self._execute_real_trade(
                     symbol,
                     "DOWN",
@@ -601,8 +369,6 @@ class RealTrader:
                     candle_round=candle_round,
                     token_id=pm_down_token_id,
                     trend_direction=trend_direction,
-                    filter_snapshot=market_filters,
-                    candle_index=candle_index,
                 )
 
             print(
@@ -622,8 +388,6 @@ class RealTrader:
         candle_round: str = None,
         token_id: Optional[str] = None,
         trend_direction: Optional[str] = None,
-        filter_snapshot: Optional[Dict[str, Any]] = None,
-        candle_index: Optional[int] = None,
     ):
         print(f"\n🔥 REAL TRADE SIGNAL - {side} @ {price:.4f} (Score: {score}) Round: {candle_round}", flush=True)
         print(f"[DEBUG _execute] Called with candle_round={candle_round}", flush=True)
@@ -713,12 +477,6 @@ class RealTrader:
             'token_id': token_id,
             'mode': mode,
             'trend_direction': trend_direction,
-            'entry_round': candle_round,
-            'entry_candle_index': candle_index,
-            'filter_snapshot': filter_snapshot or {},
-            'mfe_pct': 0.0,
-            'mae_pct': 0.0,
-            'last_price': price,
         }
 
         self._save_state()
@@ -746,8 +504,6 @@ class RealTrader:
             'token_id': token_id,
             'trend_direction': trend_direction,
             'mode': mode,
-            'filter_snapshot': filter_snapshot or {},
-            'candle_index': candle_index,
         }
 
     async def initialize_executor(self):
@@ -767,13 +523,7 @@ class RealTrader:
             self.executor_ready = False
             return False
     
-    async def check_sl_tp(
-        self,
-        symbol: str,
-        pm_up_price: float = 0.0,
-        pm_down_price: float = 0.0,
-        candle_index: Optional[int] = None,
-    ):
+    async def check_sl_tp(self, symbol: str, pm_up_price: float = 0.0, pm_down_price: float = 0.0):
         """Check SL/TP for existing positions."""
         if symbol not in self.positions:
             return None
@@ -795,34 +545,31 @@ class RealTrader:
             sl_price = entry_price - sl_distance
             tp_price = entry_price + tp_distance
             current_price = pm_up_price
-            self._update_position_excursions(symbol, current_price)
             
             if current_price >= tp_price:
                 print(f"[TP TRIGGERED] {symbol} UP | Entry: {entry_price:.4f} | Current: {current_price:.4f} | TP: {tp_price:.4f}", flush=True)
-                return await self._close_position_sl(symbol, current_price, 'TAKE_PROFIT', sl_pct, tp_pct, candle_index=candle_index)
+                return await self._close_position_sl(symbol, current_price, 'TAKE_PROFIT', sl_pct, tp_pct)
             if current_price <= sl_price:
                 print(f"[SL TRIGGERED] {symbol} UP | Entry: {entry_price:.4f} | Current: {current_price:.4f} | SL: {sl_price:.4f}", flush=True)
-                return await self._close_position_sl(symbol, current_price, 'STOP_LOSS', sl_pct, tp_pct, candle_index=candle_index)
+                return await self._close_position_sl(symbol, current_price, 'STOP_LOSS', sl_pct, tp_pct)
                 
         else:  # DOWN
             # For DOWN: SL = price goes DOWN (loss), TP = price goes UP (win)
             sl_price = entry_price - sl_distance  # Price down = loss
             tp_price = entry_price + tp_distance   # Price up = win
             current_price = pm_down_price
-            self._update_position_excursions(symbol, current_price)
             
             if current_price <= sl_price:
                 print(f"[SL TRIGGERED] {symbol} DOWN | Entry: {entry_price:.4f} | Current: {current_price:.4f} | SL: {sl_price:.4f}", flush=True)
-                return await self._close_position_sl(symbol, current_price, 'STOP_LOSS', sl_pct, tp_pct, candle_index=candle_index)
+                return await self._close_position_sl(symbol, current_price, 'STOP_LOSS', sl_pct, tp_pct)
             if current_price >= tp_price:
                 print(f"[TP TRIGGERED] {symbol} DOWN | Entry: {entry_price:.4f} | Current: {current_price:.4f} | TP: {tp_price:.4f}", flush=True)
-                return await self._close_position_sl(symbol, current_price, 'TAKE_PROFIT', sl_pct, tp_pct, candle_index=candle_index)
+                return await self._close_position_sl(symbol, current_price, 'TAKE_PROFIT', sl_pct, tp_pct)
         
         return None
     
     async def _close_position_sl(self, symbol: str, current_price: float, reason: str,
-                           sl_pct: float = 20.0, tp_pct: float = 40.0,
-                           candle_index: Optional[int] = None) -> Dict[str, Any]:
+                           sl_pct: float = 15.0, tp_pct: float = 30.0) -> Dict[str, Any]:
         """Close position with specified reason (SL or TP)."""
         global _trade_lock
         async with _trade_lock:
@@ -897,23 +644,8 @@ class RealTrader:
                 'entry_mode': position_mode,
                 'exit_order_id': exit_order_id,
                 'token_id': token_id,
-                'mfe_pct': pos.get('mfe_pct', 0.0),
-                'mae_pct': pos.get('mae_pct', 0.0),
-                'entry_round': pos.get('entry_round'),
-                'entry_candle_index': pos.get('entry_candle_index'),
-                'exit_candle_index': candle_index,
-                'filter_snapshot': pos.get('filter_snapshot', {}),
             }
             self.trade_history.append(trade)
-
-            if reason == 'STOP_LOSS' and candle_index is not None and COOLDOWN_AFTER_SL_CANDLES > 0:
-                self.cooldown_until_index[symbol] = candle_index + COOLDOWN_AFTER_SL_CANDLES + 1
-                self.last_stop_loss_reason[symbol] = {
-                    'at': datetime.now().isoformat(),
-                    'cooldown_until_index': self.cooldown_until_index[symbol],
-                    'mae_pct': pos.get('mae_pct', 0.0),
-                    'mfe_pct': pos.get('mfe_pct', 0.0),
-                }
 
             del self.positions[symbol]
             self._save_state()
@@ -948,9 +680,7 @@ class RealTrader:
             'executor_ready': self.executor_ready,
             'wins': self.wins,
             'losses': self.losses,
-            'win_rate': win_rate,
-            'pending_signals': len(self.pending_signals),
-            'cooldowns': dict(self.cooldown_until_index),
+            'win_rate': win_rate
         }
     
     def get_daily_report(self) -> str:
@@ -980,7 +710,7 @@ class RealTrader:
         
         if trade['action'] == 'OPEN':
             trade_mode = trade.get('mode', 'DRY-RUN')
-            header = f"{emoji} <b>{trade_mode} TRADE - OPEN</b> {emoji}"
+            header = f"{emoji} <b>{trade_mode} ENTRY EXECUTED</b> {emoji}"
         elif trade.get('reason') == 'STOP_LOSS':
             header = f"⚠️ <b>STOP LOSS TRIGGERED</b> ⚠️"
             emoji = "🛑"
@@ -1000,7 +730,7 @@ class RealTrader:
 {header}
 
 📊 Symbol: <code>{trade['symbol']}</code>
-📥 {trade['action']}: <b>{trade['side']}</b> token
+📥 Entry: <b>{trade['side']}</b> token
 💵 Price: {price:.4f}
 📏 Size: {trade['size']:.2f}
 """
@@ -1023,17 +753,10 @@ class RealTrader:
             
             conf = "🔥 SUPER YAKIN" if score >= 90 else "✅ SWEET SPOT" if 75 <= score <= 80 else "⚠️ FILTERED"
             text += f"\n{conf} (Score: {score})\n"
-            text += f"🛑 SL: {sl_price:.4f} ({sl_pct:.0f}%)\n"
-            text += f"🎯 TP: {tp_price:.4f} ({tp_pct:.0f}%)\n"
+            text += f"💵 Entry Price: {entry:.4f}\n"
+            text += f"🛑 Stop Loss: {sl_price:.4f} ({sl_pct:.0f}%)\n"
+            text += f"🎯 Take Profit: {tp_price:.4f} ({tp_pct:.0f}%)\n"
             text += f"📊 RR: 1:{tp_pct/sl_pct:.1f}\n"
-            snapshot = trade.get('filter_snapshot') or {}
-            if snapshot:
-                ema_spread = snapshot.get('ema_spread_pct')
-                atr_pct = snapshot.get('atr_pct')
-                if ema_spread is not None:
-                    text += f"🪄 EMA Spread: {ema_spread:.3f}%\n"
-                if atr_pct is not None:
-                    text += f"🌊 ATR: {atr_pct:.3f}%\n"
                 
         if 'pnl' in trade:
             pnl_emoji = "🟢" if trade['pnl'] >= 0 else "🔴"
@@ -1041,10 +764,6 @@ class RealTrader:
             
         if 'entry_price' in trade and trade['action'] == 'CLOSE':
             text += f"📊 Entry: {trade['entry_price']:.4f} → Exit: {trade['exit_price']:.4f}\n"
-            if 'mfe_pct' in trade:
-                text += f"🚀 MFE: {trade['mfe_pct']:+.2f}%\n"
-            if 'mae_pct' in trade:
-                text += f"🩸 MAE: {trade['mae_pct']:+.2f}%\n"
         
         if 'score' in trade:
             text += f"📈 Trend Score: {trade['score']:.0f}/100\n"
