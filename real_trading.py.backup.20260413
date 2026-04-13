@@ -34,30 +34,13 @@ MAX_TRADES_PER_DAY = 100  # Unlimited trades
 # Global lock untuk mencegah race condition
 _trade_lock = asyncio.Lock()
 
-
-def _env_bool(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
-# Strategy switches (data-driven defaults from 2026-04-13 review)
-ENABLE_UP_ENTRIES = _env_bool("ENABLE_UP_ENTRIES", True)
-ENABLE_DOWN_ENTRIES = _env_bool("ENABLE_DOWN_ENTRIES", False)
-UP_SCORE_MIN = float(os.getenv("UP_SCORE_MIN", "75"))
-UP_SCORE_MAX = float(os.getenv("UP_SCORE_MAX", "80"))
-DOWN_SCORE_MIN = float(os.getenv("DOWN_SCORE_MIN", "0"))
-DOWN_SCORE_MAX = float(os.getenv("DOWN_SCORE_MAX", "25"))
-ALLOW_NEUTRAL_TREND = _env_bool("ALLOW_NEUTRAL_TREND", False)
-KEEP_POSITION_OPEN_ON_FAILED_LIVE_CLOSE = _env_bool("KEEP_POSITION_OPEN_ON_FAILED_LIVE_CLOSE", True)
-
 def get_price_limits(score: float):
-    """Static price limits for the current expectancy-optimized setup.
-
-    Notes:
-    - UP entries are capped at 0.55 to avoid chasing late bullish moves.
-    - DOWN entries are disabled by default, but bounds stay available for future re-tests.
+    """Price limits - optimized based on data analysis (2026-04-13)
+    
+    Based on 30 trade analysis:
+    - Entry >0.60 = 100% loss rate (chasing entries)
+    - Score 75 sweet spot (60% win rate), 85-90 worse (0% win rate)
+    - UP max 0.55, DOWN min 0.45 prevents chasing
     """
     UP_MAX = 0.55      # Don't buy UP at resistance (prevent chasing)
     DOWN_MIN = 0.45    # Don't sell DOWN at support (prevent chasing)
@@ -132,28 +115,35 @@ def calculate_trend_direction(klines: list, lookback: int = 5) -> str:
 
 def check_trend_filter(side: str, trend_direction: str, klines: list = None) -> tuple[bool, str]:
     """Check if trade aligns with higher timeframe trend.
-
-    Strategy mode is strict by default:
-    - UPTREND  -> only UP entries
-    - DOWNTREND -> only DOWN entries
-    - NEUTRAL -> blocked unless ALLOW_NEUTRAL_TREND is enabled
+    
+    Implements trend-following strategy: only trade WITH the trend, not against it.
+    
+    Args:
+        side: "UP" or "DOWN"
+        trend_direction: "UPTREND", "DOWNTREND", or "NEUTRAL"
+        klines: Optional klines data for recalculation
+        
+    Returns:
+        (is_allowed: bool, reason: str)
     """
+    # If no clear trend, allow both sides
     if trend_direction == "NEUTRAL":
-        if ALLOW_NEUTRAL_TREND:
-            return True, "Neutral trend allowed by config"
-        return False, f"SKIP {side} - Neutral trend blocked (strict trend mode)"
-
+        return True, "Neutral trend - both sides allowed"
+    
+    # UPTREND: Only allow UP positions (skip DOWN)
     if trend_direction == "UPTREND":
         if side == "DOWN":
             return False, f"SKIP {side} - Counter-trend (market in uptrend)"
         return True, f"ALLOW {side} - With uptrend"
-
+    
+    # DOWNTREND: Only allow DOWN positions (skip UP)
     if trend_direction == "DOWNTREND":
         if side == "UP":
             return False, f"SKIP {side} - Counter-trend (market in downtrend)"
         return True, f"ALLOW {side} - With downtrend"
-
-    return False, f"SKIP {side} - Unknown trend state: {trend_direction}"
+    
+    # Fallback
+    return True, "Unknown trend - allowing trade"
 
 class RealTrader:
     def __init__(self, data_dir: str = "~/polymarket-bot/real_data"):
@@ -269,149 +259,91 @@ class RealTrader:
             print(f"[TREND GET ERROR] {e}", flush=True)
             return "NEUTRAL"
     
-    async def check_signal(
-        self,
-        symbol: str,
-        score: float,
-        pm_up_price: float,
-        pm_down_price: float,
-        candle_round: str = None,
-        pm_up_token_id: Optional[str] = None,
-        pm_down_token_id: Optional[str] = None,
-        trend_direction: Optional[str] = None,
-    ):
+    async def check_signal(self, symbol: str, score: float, pm_up_price: float, pm_down_price: float, candle_round: str = None):
         # Gunakan lock untuk mencegah race condition (multiple entries)
         global _trade_lock
         async with _trade_lock:
-            print(
-                f"[LOCK ACQUIRED] Checking signal for {symbol} | Score={score} | "
-                f"UP={pm_up_price} | DOWN={pm_down_price} | Trend={trend_direction} | Round={candle_round}",
-                flush=True,
-            )
-            print(
-                f"[DEBUG] last_entry_round={self.last_entry_round}, candle_round={candle_round}, "
-                f"match={self.last_entry_round == candle_round}",
-                flush=True,
-            )
+            print(f"[LOCK ACQUIRED] Checking signal for {symbol} | Score={score} | UP={pm_up_price} | DOWN={pm_down_price} | Round={candle_round}", flush=True)
+            print(f"[DEBUG] last_entry_round={self.last_entry_round}, candle_round={candle_round}, match={self.last_entry_round == candle_round}", flush=True)
             self._check_new_day()
-
+            
             if self.trades_today >= MAX_TRADES_PER_DAY:
                 print(f"[SKIP] Max trades reached: {self.trades_today}/{MAX_TRADES_PER_DAY}", flush=True)
                 return None
-
+            
             # Check if already entered this round (1 entry per round max)
             if candle_round and self.last_entry_round == candle_round:
                 print(f"[SKIP] Already entered round {candle_round} - Blocking new entry!", flush=True)
                 return None
-
+            
             max_up, min_down, min_entry, max_down = get_price_limits(score)
-
+            
             # Check if already have position for this symbol
             if symbol in self.positions:
                 pos = self.positions[symbol]
-                print(
-                    f"[SKIP] Already have {pos['side']} position for {symbol} @ {pos['entry_price']:.4f} "
-                    f"- Blocking new entry!",
-                    flush=True,
-                )
+                print(f"[SKIP] Already have {pos['side']} position for {symbol} @ {pos['entry_price']:.4f} - Blocking new entry!", flush=True)
                 return None
-
-            print(
-                f"[CHECK] No active position for {symbol}. Positions: {list(self.positions.keys())}. Checking signal...",
-                flush=True,
-            )
-
-            if not trend_direction:
-                trend_direction = self._get_current_trend(symbol)
-
-            up_score_ok = ENABLE_UP_ENTRIES and UP_SCORE_MIN <= score <= UP_SCORE_MAX
-            down_score_ok = ENABLE_DOWN_ENTRIES and DOWN_SCORE_MIN <= score <= DOWN_SCORE_MAX
-
-            if up_score_ok and pm_up_price >= min_entry and pm_up_price <= max_up:
+            
+            print(f"[CHECK] No active position for {symbol}. Positions: {list(self.positions.keys())}. Checking signal...", flush=True)
+            
+            # Get 1H trend direction from stored klines (need to pass from main.py)
+            # For now, use simple trend detection based on recent price action
+            trend_direction = self._get_current_trend(symbol)
+            
+            # UP position: check price filter + trend filter + min entry + max limit
+            if score >= 75 and pm_up_price >= min_entry and pm_up_price <= max_up:
+                # Entry price filter - prevent chasing
                 is_valid, reason = get_entry_price_filter("UP", pm_up_price)
                 if not is_valid:
                     print(f"[ENTRY FILTER] {reason}", flush=True)
                     return None
-
+                
+                # Trend filter - only trade with trend
                 trend_ok, trend_reason = check_trend_filter("UP", trend_direction)
                 if not trend_ok:
                     print(f"[TREND FILTER] {trend_reason}", flush=True)
                     return None
-
+                
                 print(f"[TREND CONFIRM] {trend_reason}", flush=True)
-                return await self._execute_real_trade(
-                    symbol,
-                    "UP",
-                    pm_up_price,
-                    score,
-                    candle_round=candle_round,
-                    token_id=pm_up_token_id,
-                    trend_direction=trend_direction,
-                )
-
-            if down_score_ok and pm_down_price >= min_entry and pm_down_price <= max_down and pm_down_price >= min_down:
+                return await self._execute_real_trade(symbol, "UP", pm_up_price, score, candle_round)
+                
+            # DOWN position: check price filter + trend filter + min entry + max entry 0.70 + min limit
+            elif score <= 25 and pm_down_price >= min_entry and pm_down_price <= max_down and pm_down_price >= min_down:
+                # Entry price filter - prevent chasing
                 is_valid, reason = get_entry_price_filter("DOWN", pm_down_price)
                 if not is_valid:
                     print(f"[ENTRY FILTER] {reason}", flush=True)
                     return None
-
+                
+                # Trend filter - only trade with trend
                 trend_ok, trend_reason = check_trend_filter("DOWN", trend_direction)
                 if not trend_ok:
                     print(f"[TREND FILTER] {trend_reason}", flush=True)
                     return None
-
+                
                 print(f"[TREND CONFIRM] {trend_reason}", flush=True)
-                return await self._execute_real_trade(
-                    symbol,
-                    "DOWN",
-                    pm_down_price,
-                    score,
-                    candle_round=candle_round,
-                    token_id=pm_down_token_id,
-                    trend_direction=trend_direction,
-                )
-
-            print(
-                f"[SKIP] Score {score} outside allowed bands | "
-                f"UP={UP_SCORE_MIN}-{UP_SCORE_MAX} enabled={ENABLE_UP_ENTRIES} | "
-                f"DOWN={DOWN_SCORE_MIN}-{DOWN_SCORE_MAX} enabled={ENABLE_DOWN_ENTRIES}",
-                flush=True,
-            )
+                return await self._execute_real_trade(symbol, "DOWN", pm_down_price, score, candle_round)
             return None
-
-    async def _execute_real_trade(
-        self,
-        symbol: str,
-        side: str,
-        price: float,
-        score: float,
-        candle_round: str = None,
-        token_id: Optional[str] = None,
-        trend_direction: Optional[str] = None,
-    ):
+    
+    async def _execute_real_trade(self, symbol: str, side: str, price: float, score: float, candle_round: str = None):
         print(f"\n🔥 REAL TRADE SIGNAL - {side} @ {price:.4f} (Score: {score}) Round: {candle_round}", flush=True)
         print(f"[DEBUG _execute] Called with candle_round={candle_round}", flush=True)
         print(f"[DEBUG _execute] executor_ready={self.executor_ready}, executor={self.executor is not None}", flush=True)
-
+        
         size = TRADE_SIZE_USDC / price
         entry_cost = TRADE_SIZE_USDC
         gross_size = size / (1 - 0.005)  # Before 0.5% fee
-
+        
         global _global_executor, _global_executor_initialized
         if not self.executor and _global_executor and _global_executor_initialized:
             self.executor = _global_executor
             self.executor_ready = True
-
+        
         order_id = None
-        mode = 'DRY-RUN'
-
-        can_trade_live = bool(self.executor_ready and self.executor and token_id)
-        if self.executor_ready and self.executor and not token_id:
-            print(f"⚠️ Missing token_id for {side} entry - forcing dry-run", flush=True)
-
-        if can_trade_live:
+        if self.executor_ready and self.executor:
             print(f"   → LIVE EXECUTION on CLOB (EOA mode)")
             try:
+                token_id = "105267568073659068217311993901927962476298440625043565106676088842803600775810"
                 order_result = await self.executor.place_market_order(
                     token_id=token_id,
                     side="BUY",
@@ -420,7 +352,6 @@ class RealTrader:
                 )
                 if order_result:
                     order_id = order_result.get('orderID', str(order_result))
-                    mode = 'LIVE'
                     print(f"✅ CLOB ORDER PLACED: {order_id}")
                     self.balance -= entry_cost
                     print(f"💰 Balance deducted: ${entry_cost:.2f} → ${self.balance:.2f}")
@@ -431,81 +362,94 @@ class RealTrader:
                     self._save_state()
                 else:
                     print("❌ CLOB order returned None - recording as dry-run")
+                    # Still increment trade counter for tracking even when order returns None
                     self.trades_today += 1
                     self.total_trades += 1
-                    self.balance -= entry_cost
+                    self.balance -= entry_cost  # Simulate balance deduction
                     self.last_entry_round = candle_round
                     print(f"[DEBUG NONE] last_entry_round set to: {self.last_entry_round}", flush=True)
                     self._save_state()
             except Exception as e:
                 print(f"❌ CLOB execution error: {e}")
                 print("   → Recording as dry-run due to error")
+                # Still increment trade counter for tracking even when error
                 self.trades_today += 1
                 self.total_trades += 1
-                self.balance -= entry_cost
+                self.balance -= entry_cost  # Simulate balance deduction
                 self.last_entry_round = candle_round
                 print(f"[DEBUG ERROR] last_entry_round set to: {self.last_entry_round}", flush=True)
                 self._save_state()
         else:
-            print("   → DRY-RUN (executor not ready or token_id missing)", flush=True)
+            print("   → DRY-RUN (executor not ready)", flush=True)
+            # Still increment trade counter for tracking even in dry-run
             self.trades_today += 1
             self.total_trades += 1
-            self.balance -= entry_cost
+            self.balance -= entry_cost  # Simulate balance deduction
             self.last_entry_round = candle_round
             print(f"[DEBUG DRY] last_entry_round set to: {self.last_entry_round}", flush=True)
             print(f"[DEBUG DRY] About to call _save_state()", flush=True)
             self._save_state()
             print(f"[DEBUG DRY] _save_state() completed", flush=True)
-
-        sl_pct, tp_pct = get_sl_tp_pct(score)
-
-        sl_price = price * (1 - sl_pct / 100)
-        tp_price = price * (1 + tp_pct / 100)
-
-        self.positions[symbol] = {
-            'side': side,
-            'entry_price': price,
-            'size': size,
-            'entry_time': datetime.now().isoformat(),
-            'entry_score': score,
-            'cost': entry_cost,
-            'sl_pct': sl_pct,
-            'tp_pct': tp_pct,
-            'sl_price': sl_price,
-            'tp_price': tp_price,
-            'order_id': order_id,
-            'token_id': token_id,
-            'mode': mode,
-            'trend_direction': trend_direction,
-        }
-
-        self._save_state()
-        print(
-            f"[POSITION SAVED] {symbol} {side} @ {price:.4f} | SL: {sl_price:.4f} | TP: {tp_price:.4f} | Mode: {mode}",
-            flush=True,
-        )
-
-        return {
-            'timestamp': datetime.now().isoformat(),
-            'symbol': symbol,
-            'side': side,
-            'action': 'OPEN',
-            'price': price,
-            'size': size,
-            'gross_size': gross_size,
-            'cost': entry_cost,
-            'entry_fee': entry_cost * 0.005,
-            'entry_fee_pct': 0.5,
-            'score': score,
-            'balance_after': self.balance,
-            'sl_pct': sl_pct,
-            'tp_pct': tp_pct,
-            'order_id': order_id,
-            'token_id': token_id,
-            'trend_direction': trend_direction,
-            'mode': mode,
-        }
-
+        
+        # Return full trade data for notification (match PaperTrader format)
+        if True:  # Always return trade data for notification
+            sl_pct, tp_pct = get_sl_tp_pct(score)
+            
+            if side == 'UP':
+                sl_price = price * (1 - sl_pct/100)
+                tp_price = price * (1 + tp_pct/100)
+            else:  # DOWN
+                sl_price = price * (1 - sl_pct/100)  # Price down = SL
+                tp_price = price * (1 + tp_pct/100)   # Price up = TP
+            
+            # Calculate SL/TP prices for position tracking
+            if side == 'UP':
+                sl_price = price * (1 - sl_pct/100)
+                tp_price = price * (1 + tp_pct/100)
+            else:  # DOWN
+                sl_price = price * (1 - sl_pct/100)  # Price down = SL
+                tp_price = price * (1 + tp_pct/100)  # Price up = TP
+            
+            # Store position for SL/TP tracking
+            self.positions[symbol] = {
+                'side': side,
+                'entry_price': price,
+                'size': size,
+                'entry_time': datetime.now().isoformat(),
+                'entry_score': score,
+                'cost': entry_cost,
+                'sl_pct': sl_pct,
+                'tp_pct': tp_pct,
+                'sl_price': sl_price,
+                'tp_price': tp_price,
+                'order_id': order_id
+            }
+            
+            # Save state immediately to persist position
+            self._save_state()
+            print(f"[POSITION SAVED] {symbol} {side} @ {price:.4f} | SL: {sl_price:.4f} | TP: {tp_price:.4f}", flush=True)
+            
+            return {
+                'timestamp': datetime.now().isoformat(),
+                'symbol': symbol,
+                'side': side,
+                'action': 'OPEN',
+                'price': price,
+                'size': size,
+                'gross_size': gross_size,
+                'cost': entry_cost,
+                'entry_fee': entry_cost * 0.005,
+                'entry_fee_pct': 0.5,
+                'score': score,
+                'balance_after': self.balance,
+                'sl_pct': sl_pct,
+                'tp_pct': tp_pct,
+                'order_id': order_id,
+                'mode': 'REAL' if order_id else 'DRY-RUN'
+            }
+        
+        return {"success": bool(order_id), "order_id": order_id}
+    
     async def initialize_executor(self):
         """Initialize CLOB executor for real trading."""
         global _global_executor, _global_executor_initialized
@@ -527,17 +471,16 @@ class RealTrader:
         """Check SL/TP for existing positions."""
         if symbol not in self.positions:
             return None
-
+        
         pos = self.positions[symbol]
         side = pos['side']
         entry_price = pos['entry_price']
         entry_score = pos.get('entry_score', 75)
-
-        sl_pct = pos.get('sl_pct')
-        tp_pct = pos.get('tp_pct')
-        if sl_pct is None or tp_pct is None:
-            sl_pct, tp_pct = get_sl_tp_pct(entry_score)
-
+        
+        # Get adaptive SL/TP based on entry score
+        sl_pct, tp_pct = get_sl_tp_pct(entry_score)
+        
+        # Calculate SL and TP distances
         sl_distance = entry_price * (sl_pct / 100)
         tp_distance = entry_price * (tp_pct / 100)
         
@@ -571,103 +514,75 @@ class RealTrader:
     async def _close_position_sl(self, symbol: str, current_price: float, reason: str,
                            sl_pct: float = 20.0, tp_pct: float = 40.0) -> Dict[str, Any]:
         """Close position with specified reason (SL or TP)."""
-        global _trade_lock
-        async with _trade_lock:
-            if symbol not in self.positions:
-                print(f"[CLOSE ERROR] {symbol} not in positions!", flush=True)
-                return None
-
-            pos = self.positions[symbol]
-            side = pos['side']
-            entry_price = pos['entry_price']
-            size = pos['size']
-            entry_cost = pos.get('cost', size * entry_price)
-            position_mode = pos.get('mode', 'DRY-RUN')
-            token_id = pos.get('token_id')
-
-            print(
-                f"[CLOSING] {symbol} {side} @ {entry_price:.4f} | Reason: {reason} | "
-                f"Current: {current_price:.4f} | Mode: {position_mode}",
-                flush=True,
-            )
-
-            exit_order_id = None
-            if position_mode == 'LIVE' and self.executor_ready and self.executor and token_id:
-                try:
-                    print(f"   → LIVE CLOSE via SELL {size:.4f} shares", flush=True)
-                    close_result = await self.executor.place_market_order(
-                        token_id=token_id,
-                        side="SELL",
-                        size=size,
-                        price=current_price,
-                    )
-                    if not close_result:
-                        print("❌ Live close returned None", flush=True)
-                        if KEEP_POSITION_OPEN_ON_FAILED_LIVE_CLOSE:
-                            print("[LIVE CLOSE] Keeping position open because close failed", flush=True)
-                            return None
-                    else:
-                        exit_order_id = close_result.get('orderID', str(close_result))
-                        print(f"✅ LIVE CLOSE ORDER PLACED: {exit_order_id}", flush=True)
-                except Exception as e:
-                    print(f"❌ Live close failed: {e}", flush=True)
-                    if KEEP_POSITION_OPEN_ON_FAILED_LIVE_CLOSE:
-                        print("[LIVE CLOSE] Keeping position open because close raised exception", flush=True)
-                        return None
-
-            gross_exit_value = size * current_price
-            exit_value = gross_exit_value
-            pnl = exit_value - entry_cost
-
-            if reason == 'TAKE_PROFIT':
-                self.wins += 1
-            elif reason == 'STOP_LOSS':
-                self.losses += 1
-
-            self.total_pnl += pnl
-            self.balance += exit_value
-
-            trade = {
-                'timestamp': datetime.now().isoformat(),
-                'symbol': symbol,
-                'side': side,
-                'action': 'CLOSE',
-                'reason': reason,
-                'entry_price': entry_price,
-                'exit_price': current_price,
-                'size': size,
-                'pnl': pnl,
-                'balance_after': self.balance,
-                'entry_score': pos.get('entry_score', 75),
-                'sl_pct': sl_pct,
-                'tp_pct': tp_pct,
-                'entry_mode': position_mode,
-                'exit_order_id': exit_order_id,
-                'token_id': token_id,
-            }
-            self.trade_history.append(trade)
-
-            del self.positions[symbol]
-            self._save_state()
-            print(f"[POSITION CLOSED] {symbol} deleted. Remaining positions: {len(self.positions)}", flush=True)
-
-            if _telegram_available:
-                try:
-                    asyncio.create_task(send_sl_tp_alert(
-                        symbol=symbol,
-                        side=side,
-                        reason=reason,
-                        entry_price=entry_price,
-                        exit_price=current_price,
-                        pnl=pnl,
-                        balance=self.balance
-                    ))
-                    print(f"[TELEGRAM] SL/TP notification sent for {symbol}", flush=True)
-                except Exception as e:
-                    print(f"[TELEGRAM ERROR] Failed to send SL/TP notification: {e}", flush=True)
-
-            return trade
-
+        if symbol not in self.positions:
+            print(f"[CLOSE ERROR] {symbol} not in positions!", flush=True)
+            return None
+        
+        pos = self.positions[symbol]
+        side = pos['side']
+        entry_price = pos['entry_price']
+        size = pos['size']
+        entry_cost = pos.get('cost', size * entry_price)
+        
+        print(f"[CLOSING] {symbol} {side} @ {entry_price:.4f} | Reason: {reason} | Current: {current_price:.4f}", flush=True)
+        
+        # Calculate gross exit value
+        gross_exit_value = size * current_price
+        
+        # Net exit value (no exit fee for limit orders)
+        exit_value = gross_exit_value
+        
+        # Calculate PnL
+        pnl = exit_value - entry_cost
+        
+        # Track Win/Loss
+        if reason == 'TAKE_PROFIT':
+            self.wins += 1
+        elif reason == 'STOP_LOSS':
+            self.losses += 1
+        
+        self.total_pnl += pnl
+        self.balance += exit_value
+        
+        trade = {
+            'timestamp': datetime.now().isoformat(),
+            'symbol': symbol,
+            'side': side,
+            'action': 'CLOSE',
+            'reason': reason,
+            'entry_price': entry_price,
+            'exit_price': current_price,
+            'size': size,
+            'pnl': pnl,
+            'balance_after': self.balance,
+            'entry_score': pos.get('entry_score', 75),
+            'sl_pct': sl_pct,
+            'tp_pct': tp_pct
+        }
+        self.trade_history.append(trade)
+        
+        del self.positions[symbol]
+        self._save_state()
+        print(f"[POSITION CLOSED] {symbol} deleted. Remaining positions: {len(self.positions)}", flush=True)
+        
+        # Send Telegram notification for SL/TP hit
+        if _telegram_available:
+            try:
+                asyncio.create_task(send_sl_tp_alert(
+                    symbol=symbol,
+                    side=side,
+                    reason=reason,
+                    entry_price=entry_price,
+                    exit_price=current_price,
+                    pnl=pnl,
+                    balance=self.balance
+                ))
+                print(f"[TELEGRAM] SL/TP notification sent for {symbol}", flush=True)
+            except Exception as e:
+                print(f"[TELEGRAM ERROR] Failed to send SL/TP notification: {e}", flush=True)
+        
+        return trade
+    
     def get_status(self):
         total_closed = self.wins + self.losses
         win_rate = (self.wins / total_closed * 100) if total_closed > 0 else 0.0
@@ -709,8 +624,7 @@ class RealTrader:
         emoji = "🟢" if trade['side'] == 'UP' else "🔴"
         
         if trade['action'] == 'OPEN':
-            trade_mode = trade.get('mode', 'DRY-RUN')
-            header = f"{emoji} <b>{trade_mode} TRADE - OPEN</b> {emoji}"
+            header = f"{emoji} <b>PAPER TRADE - OPEN</b> {emoji}"
         elif trade.get('reason') == 'STOP_LOSS':
             header = f"⚠️ <b>STOP LOSS TRIGGERED</b> ⚠️"
             emoji = "🛑"
@@ -751,7 +665,7 @@ class RealTrader:
                 sl_price = entry * (1 - sl_pct/100)
                 tp_price = entry * (1 + tp_pct/100)
             
-            conf = "🔥 SUPER YAKIN" if score >= 90 else "✅ SWEET SPOT" if 75 <= score <= 80 else "⚠️ FILTERED"
+            conf = "🔥 SUPER YAKIN" if score >= 90 else "✅ YAKIN" if score >= 80 else "⚠️ BORDERLINE"
             text += f"\n{conf} (Score: {score})\n"
             text += f"🛑 SL: {sl_price:.4f} ({sl_pct:.0f}%)\n"
             text += f"🎯 TP: {tp_price:.4f} ({tp_pct:.0f}%)\n"
