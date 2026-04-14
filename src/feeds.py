@@ -8,6 +8,17 @@ from datetime import datetime, timezone, timedelta
 
 import config
 
+# Import feed validation from real_trading
+try:
+    from real_trading import set_feed_valid, is_feed_valid
+    _feed_validation_available = True
+except ImportError:
+    _feed_validation_available = False
+    def set_feed_valid(valid, reason=""):
+        pass
+    def is_feed_valid():
+        return True
+
 
 class State:
     def __init__(self):
@@ -256,6 +267,9 @@ async def pm_feed(state: State, coin: str = "BTC", tf: str = "15m"):
                         # Invalid prices (0, 1, or None) indicate round change
                         if state.pm_up in [None, 0.0, 1.0] or state.pm_dn in [None, 0.0, 1.0]:
                             invalid_price_count += 1
+                            if invalid_price_count >= 3:  # Mark feed invalid after 3 consecutive invalid messages
+                                if invalid_price_count == 3:
+                                    set_feed_valid(False, f"Prices invalid for {invalid_price_count} messages")
                             if invalid_price_count >= 5:  # After 5 consecutive invalid messages
                                 elapsed = time.time() - last_token_refresh
                                 if elapsed > 60:  # Wait at least 60s before refreshing
@@ -270,6 +284,9 @@ async def pm_feed(state: State, coin: str = "BTC", tf: str = "15m"):
                                         invalid_price_count = 0
                                         break  # Break inner loop to reconnect with new tokens
                         else:
+                            # Prices are valid
+                            if invalid_price_count > 0:
+                                set_feed_valid(True, f"Prices valid again (pm_up={state.pm_up}, pm_dn={state.pm_dn})")
                             invalid_price_count = 0  # Reset counter when prices valid
 
                     except websockets.exceptions.ConnectionClosed:
@@ -287,6 +304,14 @@ def _pm_apply(asset, asks, state):
 
 
 def _pm_set(asset, price, state):
+    # Validate price before storing - reject suspicious values
+    if price in [0.0, 1.0]:
+        print(f"  [PM] Rejecting suspicious price {price} for {asset[:20]}...", flush=True)
+        return
+    if price < 0.01 or price > 0.99:
+        print(f"  [PM] Rejecting out-of-bounds price {price} for {asset[:20]}...", flush=True)
+        return
+    
     if asset == state.pm_up_id:
         state.pm_up = price
     elif asset == state.pm_dn_id:

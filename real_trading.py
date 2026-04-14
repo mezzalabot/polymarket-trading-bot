@@ -34,6 +34,22 @@ MAX_TRADES_PER_DAY = 100  # Unlimited trades
 # Global lock untuk mencegah race condition
 _trade_lock = asyncio.Lock()
 
+# Feed state tracking untuk validasi TP/SL
+_feed_state = {
+    'valid': True,
+    'last_valid_price': {},
+    'last_update_ts': {},
+    'refreshing': False,
+    'pending_tp_sl': {},  # 2-step confirmation buffer
+}
+
+# Price validation constants
+MIN_VALID_PRICE = 0.01
+MAX_VALID_PRICE = 0.99
+MAX_PRICE_JUMP_ABS = 0.25  # Reject if price jumps >0.25 in single poll
+MAX_PRICE_CHANGE_PCT = 50  # Reject if price changes >50% in seconds
+SUSPICIOUS_VALUES = [0.0, 1.0]  # Reject exact 0 or 1 (resolution only)
+
 
 def _env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
@@ -51,6 +67,145 @@ DOWN_SCORE_MIN = float(os.getenv("DOWN_SCORE_MIN", "0"))
 DOWN_SCORE_MAX = float(os.getenv("DOWN_SCORE_MAX", "25"))
 ALLOW_NEUTRAL_TREND = _env_bool("ALLOW_NEUTRAL_TREND", False)
 KEEP_POSITION_OPEN_ON_FAILED_LIVE_CLOSE = _env_bool("KEEP_POSITION_OPEN_ON_FAILED_LIVE_CLOSE", True)
+
+def validate_price(current: float, previous: float, symbol: str) -> tuple[bool, str]:
+    """Validate price to detect corrupt/invalid feed data.
+    
+    Returns: (is_valid, reason)
+    """
+    # Check for None/NaN
+    if current is None or current != current:  # NaN check
+        return False, "Price is None or NaN"
+    
+    # Check bounds
+    if current <= MIN_VALID_PRICE:
+        return False, f"Price {current:.4f} below minimum {MIN_VALID_PRICE}"
+    if current >= MAX_VALID_PRICE:
+        return False, f"Price {current:.4f} above maximum {MAX_VALID_PRICE}"
+    
+    # Check suspicious exact values (0.0 or 1.0)
+    if current in SUSPICIOUS_VALUES:
+        return False, f"Price {current} is suspicious (exact resolution value)"
+    
+    # Check extreme jumps
+    if previous and previous > 0:
+        abs_change = abs(current - previous)
+        pct_change = (abs_change / previous) * 100
+        
+        if abs_change > MAX_PRICE_JUMP_ABS:
+            return False, f"Price jump too large: {abs_change:.4f} ({pct_change:.1f}%)"
+        if pct_change > MAX_PRICE_CHANGE_PCT:
+            return False, f"Price change too extreme: {pct_change:.1f}%"
+    
+    return True, ""
+
+
+def set_feed_valid(valid: bool, reason: str = ""):
+    """Set feed validation state. Call this when feed becomes invalid/valid."""
+    global _feed_state
+    old_valid = _feed_state['valid']
+    _feed_state['valid'] = valid
+    _feed_state['refreshing'] = not valid
+    
+    if not valid and old_valid:
+        print(f"[FEED] Marked INVALID: {reason}", flush=True)
+    elif valid and not old_valid:
+        print(f"[FEED] Marked VALID: {reason}", flush=True)
+        # Clear pending TP/SL on revalidation
+        _feed_state['pending_tp_sl'] = {}
+
+
+def is_feed_valid() -> bool:
+    """Check if feed is currently valid for TP/SL decisions."""
+    return _feed_state['valid'] and not _feed_state['refreshing']
+
+
+def update_price_tracking(symbol: str, price: float):
+    """Update price tracking with validation."""
+    global _feed_state
+    
+    previous = _feed_state['last_valid_price'].get(symbol)
+    is_valid, reason = validate_price(price, previous, symbol)
+    
+    if is_valid:
+        _feed_state['last_valid_price'][symbol] = price
+        _feed_state['last_update_ts'][symbol] = datetime.now()
+        if not _feed_state['valid']:
+            set_feed_valid(True, f"Valid price received for {symbol}")
+    else:
+        print(f"[PRICE REJECTED] {symbol}: {reason}", flush=True)
+    
+    return is_valid
+
+
+def check_tp_sl_with_confirmation(symbol: str, side: str, current_price: float, 
+                                   entry_price: float, sl_price: float, tp_price: float) -> tuple[bool, str, float]:
+    """2-step confirmation for TP/SL to avoid fakeouts from bad data.
+    
+    Returns: (should_close, reason, confirmed_price)
+    """
+    global _feed_state
+    
+    # Don't check if feed invalid
+    if not is_feed_valid():
+        return False, "Feed invalid", current_price
+    
+    # Validate current price
+    previous = _feed_state['last_valid_price'].get(symbol)
+    is_valid, reject_reason = validate_price(current_price, previous, symbol)
+    
+    if not is_valid:
+        return False, f"Price validation failed: {reject_reason}", current_price
+    
+    # Check for trigger condition
+    trigger_key = f"{symbol}_{side}"
+    pending = _feed_state['pending_tp_sl'].get(trigger_key)
+    
+    if side == 'UP':
+        if current_price >= tp_price:
+            condition = 'TP'
+        elif current_price <= sl_price:
+            condition = 'SL'
+        else:
+            # Clear any pending state
+            if trigger_key in _feed_state['pending_tp_sl']:
+                del _feed_state['pending_tp_sl'][trigger_key]
+            return False, "", current_price
+    else:  # DOWN
+        if current_price >= tp_price:
+            condition = 'TP'
+        elif current_price <= sl_price:
+            condition = 'SL'
+        else:
+            if trigger_key in _feed_state['pending_tp_sl']:
+                del _feed_state['pending_tp_sl'][trigger_key]
+            return False, "", current_price
+    
+    # 2-step confirmation
+    if pending and pending['condition'] == condition:
+        # Second confirmation received
+        time_since_first = (datetime.now() - pending['timestamp']).total_seconds()
+        if time_since_first < 5:  # Within 5 seconds
+            print(f"[2-STEP CONFIRMED] {symbol} {side} {condition} | "
+                  f"First: {pending['price']:.4f}, Now: {current_price:.4f} | "
+                  f"Latency: {time_since_first:.1f}s", flush=True)
+            del _feed_state['pending_tp_sl'][trigger_key]
+            return True, condition, current_price
+        else:
+            # Stale confirmation, reset
+            del _feed_state['pending_tp_sl'][trigger_key]
+    
+    # First trigger, mark as pending
+    _feed_state['pending_tp_sl'][trigger_key] = {
+        'condition': condition,
+        'price': current_price,
+        'timestamp': datetime.now()
+    }
+    print(f"[PENDING CONFIRMATION] {symbol} {side} {condition} @ {current_price:.4f} "
+          f"(waiting for 2nd confirmation)", flush=True)
+    
+    return False, "pending_confirmation", current_price
+
 
 def get_price_limits(score: float):
     """Static price limits for the current expectancy-optimized setup.
@@ -524,8 +679,13 @@ class RealTrader:
             return False
     
     async def check_sl_tp(self, symbol: str, pm_up_price: float = 0.0, pm_down_price: float = 0.0):
-        """Check SL/TP for existing positions."""
+        """Check SL/TP for existing positions with validation and 2-step confirmation."""
         if symbol not in self.positions:
+            return None
+
+        # Don't check TP/SL if feed is invalid
+        if not is_feed_valid():
+            print(f"[TP/SL PAUSED] {symbol}: Feed invalid or refreshing", flush=True)
             return None
 
         pos = self.positions[symbol]
@@ -541,30 +701,41 @@ class RealTrader:
         sl_distance = entry_price * (sl_pct / 100)
         tp_distance = entry_price * (tp_pct / 100)
         
+        # Get current price for the side
         if side == 'UP':
+            current_price = pm_up_price
             sl_price = entry_price - sl_distance
             tp_price = entry_price + tp_distance
-            current_price = pm_up_price
-            
-            if current_price >= tp_price:
-                print(f"[TP TRIGGERED] {symbol} UP | Entry: {entry_price:.4f} | Current: {current_price:.4f} | TP: {tp_price:.4f}", flush=True)
-                return await self._close_position_sl(symbol, current_price, 'TAKE_PROFIT', sl_pct, tp_pct)
-            if current_price <= sl_price:
-                print(f"[SL TRIGGERED] {symbol} UP | Entry: {entry_price:.4f} | Current: {current_price:.4f} | SL: {sl_price:.4f}", flush=True)
-                return await self._close_position_sl(symbol, current_price, 'STOP_LOSS', sl_pct, tp_pct)
-                
         else:  # DOWN
-            # For DOWN: SL = price goes DOWN (loss), TP = price goes UP (win)
-            sl_price = entry_price - sl_distance  # Price down = loss
-            tp_price = entry_price + tp_distance   # Price up = win
             current_price = pm_down_price
-            
-            if current_price <= sl_price:
-                print(f"[SL TRIGGERED] {symbol} DOWN | Entry: {entry_price:.4f} | Current: {current_price:.4f} | SL: {sl_price:.4f}", flush=True)
-                return await self._close_position_sl(symbol, current_price, 'STOP_LOSS', sl_pct, tp_pct)
-            if current_price >= tp_price:
-                print(f"[TP TRIGGERED] {symbol} DOWN | Entry: {entry_price:.4f} | Current: {current_price:.4f} | TP: {tp_price:.4f}", flush=True)
-                return await self._close_position_sl(symbol, current_price, 'TAKE_PROFIT', sl_pct, tp_pct)
+            sl_price = entry_price + sl_distance  # For DOWN, price going up = loss
+            tp_price = entry_price - tp_distance   # For DOWN, price going down = win
+        
+        # Validate price before any TP/SL check
+        is_valid, reject_reason = validate_price(current_price, 
+                                                  _feed_state['last_valid_price'].get(symbol),
+                                                  symbol)
+        if not is_valid:
+            print(f"[SKIP TP/SL CHECK] {symbol}: {reject_reason}", flush=True)
+            return None
+        
+        # Update price tracking
+        update_price_tracking(symbol, current_price)
+        
+        # Check for TP/SL with 2-step confirmation
+        should_close, reason, confirmed_price = check_tp_sl_with_confirmation(
+            symbol, side, current_price, entry_price, sl_price, tp_price
+        )
+        
+        if should_close:
+            if reason == 'TP':
+                print(f"[TP CONFIRMED] {symbol} {side} | Entry: {entry_price:.4f} | "
+                      f"Confirmed: {confirmed_price:.4f} | TP: {tp_price:.4f}", flush=True)
+                return await self._close_position_sl(symbol, confirmed_price, 'TAKE_PROFIT', sl_pct, tp_pct)
+            elif reason == 'SL':
+                print(f"[SL CONFIRMED] {symbol} {side} | Entry: {entry_price:.4f} | "
+                      f"Confirmed: {confirmed_price:.4f} | SL: {sl_price:.4f}", flush=True)
+                return await self._close_position_sl(symbol, confirmed_price, 'STOP_LOSS', sl_pct, tp_pct)
         
         return None
     
