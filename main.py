@@ -8,7 +8,6 @@ sys.path.insert(0, os.path.expanduser("~/polymarket-bot"))
 import clob_patch
 
 import asyncio
-import time
 from datetime import datetime, timezone, timedelta
 
 import rich
@@ -101,6 +100,34 @@ class DashboardState:
 dash_state = DashboardState()
 
 
+def _pm_feed_ok(state: feeds.State) -> bool:
+    if not getattr(state, "pm_feed_connected", False):
+        return False
+    if getattr(state, "pm_feed_guard_active", False):
+        return False
+    last_quote_ts = float(getattr(state, "pm_last_quote_ts", 0.0) or 0.0)
+    if last_quote_ts and (datetime.now().timestamp() - last_quote_ts) > 20:
+        return False
+    pm_up = getattr(state, "pm_up", None)
+    pm_dn = getattr(state, "pm_dn", None)
+    if pm_up is None or pm_dn is None:
+        return False
+    if not (0.0 < pm_up < 1.0 and 0.0 < pm_dn < 1.0):
+        return False
+    return True
+
+
+def _pm_feed_label(state: feeds.State) -> str:
+    status = "CONNECTED" if getattr(state, "pm_feed_connected", False) else "DISCONNECTED"
+    if getattr(state, "pm_feed_guard_active", False):
+        status += " | GUARD"
+    reason = getattr(state, "pm_last_refresh_reason", "") or getattr(state, "pm_last_error", "")
+    if reason:
+        status += f" | {reason}"
+    return status
+
+
+
 def get_strong_reasons(indicators):
     reasons = []
     if o := indicators.get("order_book_imbalance"):
@@ -154,88 +181,6 @@ def _build_candle_round(now_et: datetime):
     return candle_round, start_hour, end_hour, ampm, time_left
 
 
-def _is_valid_binary_price(price) -> bool:
-    try:
-        price = float(price)
-    except (TypeError, ValueError):
-        return False
-    return 0.0 < price < 1.0
-
-
-def _update_pm_guard_state(state: feeds.State) -> dict:
-    """Track Polymarket feed health and add a short guard window after invalid/refresh states."""
-    now_ts = time.time()
-
-    for attr, default in {
-        'pm_guard_until': 0.0,
-        'pm_guard_reason': '',
-        'pm_invalid_streak': 0,
-        'pm_last_valid_ts': 0.0,
-        'pm_last_token_pair': None,
-        'pm_last_good_up': None,
-        'pm_last_good_dn': None,
-        'pm_prev_good_up': None,
-        'pm_prev_good_dn': None,
-        'pm_token_changed_at': 0.0,
-    }.items():
-        if not hasattr(state, attr):
-            setattr(state, attr, default)
-
-    current_pair = (getattr(state, 'pm_up_id', None), getattr(state, 'pm_dn_id', None))
-    if state.pm_last_token_pair and current_pair != state.pm_last_token_pair:
-        state.pm_guard_until = max(state.pm_guard_until, now_ts + 20)
-        state.pm_guard_reason = 'token refresh / round change detected'
-        state.pm_token_changed_at = now_ts
-    state.pm_last_token_pair = current_pair
-
-    up_price = getattr(state, 'pm_up', None)
-    dn_price = getattr(state, 'pm_dn', None)
-    up_valid = _is_valid_binary_price(up_price)
-    dn_valid = _is_valid_binary_price(dn_price)
-
-    if up_valid and dn_valid:
-        if state.pm_last_good_up is None or float(up_price) != float(state.pm_last_good_up):
-            state.pm_prev_good_up = state.pm_last_good_up
-            state.pm_last_good_up = float(up_price)
-        if state.pm_last_good_dn is None or float(dn_price) != float(state.pm_last_good_dn):
-            state.pm_prev_good_dn = state.pm_last_good_dn
-            state.pm_last_good_dn = float(dn_price)
-        state.pm_last_valid_ts = now_ts
-        state.pm_invalid_streak = 0
-    else:
-        state.pm_invalid_streak += 1
-        state.pm_guard_until = max(state.pm_guard_until, now_ts + 20)
-        if not up_valid and not dn_valid:
-            state.pm_guard_reason = 'both PM quotes invalid'
-        elif not up_valid:
-            state.pm_guard_reason = 'UP quote invalid'
-        else:
-            state.pm_guard_reason = 'DOWN quote invalid'
-
-    quote_age = (now_ts - state.pm_last_valid_ts) if state.pm_last_valid_ts else None
-    guard_active = now_ts < state.pm_guard_until
-    if quote_age is not None and quote_age > 15:
-        guard_active = True
-        state.pm_guard_reason = f'stale quote ({quote_age:.1f}s)'
-
-    return {
-        'ts': now_ts,
-        'guard_active': guard_active,
-        'guard_reason': getattr(state, 'pm_guard_reason', ''),
-        'quote_age_sec': quote_age,
-        'max_quote_age_sec': 15.0,
-        'invalid_streak': getattr(state, 'pm_invalid_streak', 0),
-        'pm_up_valid': up_valid,
-        'pm_dn_valid': dn_valid,
-        'pm_up_last_good': getattr(state, 'pm_last_good_up', None),
-        'pm_dn_last_good': getattr(state, 'pm_last_good_dn', None),
-        'pm_up_prev_good': getattr(state, 'pm_prev_good_up', None),
-        'pm_dn_prev_good': getattr(state, 'pm_prev_good_dn', None),
-        'pm_up_token_id': getattr(state, 'pm_up_id', None),
-        'pm_dn_token_id': getattr(state, 'pm_dn_id', None),
-    }
-
-
 async def position_monitor_loop(state: feeds.State, coin: str, tf: str, interval: float = 2.0):
     await asyncio.sleep(2)
     symbol_key = f"{coin}-{tf}"
@@ -243,13 +188,22 @@ async def position_monitor_loop(state: feeds.State, coin: str, tf: str, interval
     while True:
         try:
             if hasattr(paper_trader, 'check_sl_tp'):
-                market_meta = _update_pm_guard_state(state)
-                await paper_trader.check_sl_tp(
+                sltp_trade = await paper_trader.check_sl_tp(
                     symbol_key,
                     state.pm_up or 0,
                     state.pm_dn or 0,
-                    market_meta=market_meta,
                 )
+            else:
+                sltp_trade = None
+
+            if sltp_trade and TELEGRAM_ENABLED:
+                try:
+                    alert_text = paper_trader.format_trade_alert(sltp_trade)
+                    await send_message(alert_text)
+                    reason = sltp_trade.get('reason', 'CLOSE')
+                    print(f"[SL/TP NOTIFICATION] {reason} for {sltp_trade.get('side')} - SENT", flush=True)
+                except Exception as e:
+                    print(f"[ERROR] SL/TP notification failed: {e}", flush=True)
         except Exception as e:
             print(f"[ERROR] Position monitor failed: {e}", flush=True)
 
@@ -301,8 +255,6 @@ async def display_loop(state: feeds.State, trend_state: feeds.State, coin: str, 
                         )
                 except Exception as e:
                     print(f"[ERROR] Trend change notify failed: {e}", flush=True)
-
-                market_meta = _update_pm_guard_state(state)
 
                 et_offset = timedelta(hours=-4)
                 et_tz = timezone(et_offset)
@@ -356,7 +308,7 @@ async def display_loop(state: feeds.State, trend_state: feeds.State, coin: str, 
                             f"📉 Polymarket DOWN: {pm_dn_str}\n"
                             f"🎯 Direction: {direction} (Score: {score})\n"
                             f"🧭 HTF Trend: {trend_direction}\n"
-                            f"🛡️ Feed Guard: {'ACTIVE' if market_meta['guard_active'] else 'OK'}\n"
+                            f"📡 Feed: {_pm_feed_label(state)}\n"
                             f"⏱️ Time Left: {time_left} min"
                             f"{position_info}\n"
                             f"💰 Balance: ${status['balance']:.2f} | Trades: {status['trades_today']}/100 | PnL: ${status['total_pnl']:.2f}\n"
@@ -368,10 +320,10 @@ async def display_loop(state: feeds.State, trend_state: feeds.State, coin: str, 
 
                 trade_executed = False
                 trade = None
-                try:
-                    if market_meta.get('guard_active'):
-                        print(f"[PM GUARD] Skipping new entry: {market_meta.get('guard_reason', 'feed unstable')}", flush=True)
-                    else:
+                if not _pm_feed_ok(state):
+                    print(f"[PM GUARD] Skip entry | {_pm_feed_label(state)}", flush=True)
+                else:
+                    try:
                         trade = await paper_trader.check_signal(
                             f"{coin}-{tf}",
                             score,
@@ -385,8 +337,8 @@ async def display_loop(state: feeds.State, trend_state: feeds.State, coin: str, 
                         if trade:
                             trade_executed = True
                             print(f"[TRADE EXECUTED] {trade.get('side')} @ {trade.get('price',0):.4f}", flush=True)
-                except Exception as e:
-                    print(f"[ERROR] Trade execution failed: {e}", flush=True)
+                    except Exception as e:
+                        print(f"[ERROR] Trade execution failed: {e}", flush=True)
 
                 if trade_executed and trade and TELEGRAM_ENABLED:
                     try:
@@ -452,7 +404,7 @@ async def display_loop(state: feeds.State, trend_state: feeds.State, coin: str, 
                     status = paper_trader.get_status()
                     print(
                         f"[{now}] BTC={state.mid:,.0f} | Score={score:.0f} | {direction} | "
-                        f"HTF={trend_direction} | Guard={'ON' if market_meta.get('guard_active') else 'OFF'} | Trades={status['total_trades']} | PnL=${status['total_pnl']:.2f}",
+                        f"HTF={trend_direction} | Trades={status['total_trades']} | PnL=${status['total_pnl']:.2f}",
                         flush=True,
                     )
                 except Exception as e:
@@ -489,7 +441,10 @@ async def main():
     state = feeds.State()
     trend_state = feeds.State()
 
-    state.pm_up_id, state.pm_dn_id = feeds.fetch_pm_tokens(coin, tf)
+    if hasattr(feeds, "fetch_pm_tokens_robust"):
+        state.pm_up_id, state.pm_dn_id, state.pm_market_slug = feeds.fetch_pm_tokens_robust(coin, tf)
+    else:
+        state.pm_up_id, state.pm_dn_id = feeds.fetch_pm_tokens(coin, tf)
     if state.pm_up_id:
         console.print(f"  [PM] Up   → {state.pm_up_id[:24]}…")
         console.print(f"  [PM] Down → {state.pm_dn_id[:24]}…")
