@@ -248,61 +248,208 @@ def fetch_pm_event_data_by_slug(slug: str) -> dict | None:
         return None
 
 
-def _score_active_event_for_tf(event: dict[str, Any], coin: str, tf: str) -> int:
-    ticker = str(event.get("ticker") or event.get("slug") or "").lower()
-    prefix_short = f"{config.COIN_PM[coin]}-updown-{tf}-"
-    prefix_long = f"{config.COIN_PM_LONG[coin]}-up-or-down"
+def _safe_lower(value: Any) -> str:
+    return str(value or "").strip().lower()
+
+
+def _parse_gamma_dt(value: Any) -> datetime | None:
+    if not value:
+        return None
+    raw = str(value).strip()
+    if not raw:
+        return None
+    try:
+        if raw.endswith("Z"):
+            raw = raw[:-1] + "+00:00"
+        dt = datetime.fromisoformat(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _event_text_blob(event: dict[str, Any]) -> str:
+    parts = [
+        event.get("ticker"),
+        event.get("slug"),
+        event.get("title"),
+        event.get("question"),
+        event.get("description"),
+    ]
+    return " | ".join(_safe_lower(p) for p in parts if p)
+
+
+def _tf_markers(tf: str) -> list[str]:
+    mapping = {
+        "5m": ["5m", "5 minutes", "5-minute"],
+        "15m": ["15m", "15 minutes", "15-minute"],
+        "1h": ["1h", "1 hour", "60 minutes", "hourly"],
+        "4h": ["4h", "4 hours", "4-hour"],
+        "daily": ["daily", "1 day", "24 hours", "24-hour", "tomorrow"],
+    }
+    return mapping.get(tf, [tf])
+
+
+def _coin_markers(coin: str) -> list[str]:
+    short = _safe_lower(config.COIN_PM.get(coin, coin))
+    long = _safe_lower(config.COIN_PM_LONG.get(coin, coin))
+    markers = [short, long]
+    if short == "btc":
+        markers.extend(["bitcoin", "btc/usd", "btc up or down"])
+    return list(dict.fromkeys(markers))
+
+
+def _event_matches_coin_tf(event: dict[str, Any], coin: str, tf: str) -> bool:
+    text = _event_text_blob(event)
+    if not text:
+        return False
+    if not any(marker in text for marker in _coin_markers(coin)):
+        return False
+    if not any(marker in text for marker in _tf_markers(tf)):
+        return False
+    return True
+
+
+def _extract_event_window(event: dict[str, Any]) -> tuple[datetime | None, datetime | None]:
+    start_dt = (
+        _parse_gamma_dt(event.get("start_date"))
+        or _parse_gamma_dt(event.get("startTime"))
+        or _parse_gamma_dt(event.get("startDate"))
+    )
+    end_dt = (
+        _parse_gamma_dt(event.get("end_date"))
+        or _parse_gamma_dt(event.get("endTime"))
+        or _parse_gamma_dt(event.get("endDate"))
+        or _parse_gamma_dt(event.get("closedTime"))
+    )
+    return start_dt, end_dt
+
+
+def _score_active_event_for_tf(event: dict[str, Any], coin: str, tf: str, now_utc: datetime | None = None) -> int:
+    now_utc = now_utc or datetime.now(timezone.utc)
     score = 0
+    text = _event_text_blob(event)
+    ticker = _safe_lower(event.get("ticker") or event.get("slug"))
+    prefix_short = f"{_safe_lower(config.COIN_PM[coin])}-updown-{tf}-"
+    prefix_long = f"{_safe_lower(config.COIN_PM_LONG[coin])}-up-or-down"
     if ticker.startswith(prefix_short):
-        score += 100
-    if prefix_long in ticker:
-        score += 50
+        score += 220
+    if prefix_long in text:
+        score += 90
+    if _event_matches_coin_tf(event, coin, tf):
+        score += 120
     if event.get("active") is True:
-        score += 20
+        score += 120
     if event.get("closed") is False:
-        score += 20
+        score += 80
+    if event.get("enableOrderBook") is True:
+        score += 30
     if event.get("markets"):
-        score += 10
+        score += 20
+
+    start_dt, end_dt = _extract_event_window(event)
+    if start_dt and start_dt <= now_utc:
+        score += 20
+    if end_dt:
+        minutes_to_end = (end_dt - now_utc).total_seconds() / 60.0
+        if 0 <= minutes_to_end <= 30:
+            score += 240 - int(minutes_to_end * 6)
+        elif -5 <= minutes_to_end < 0:
+            score += 20
+        elif 30 < minutes_to_end <= 240:
+            score += max(0, 80 - int((minutes_to_end - 30) / 3))
+        else:
+            score -= 120
+
+    try:
+        score += min(int(float(event.get("volume24hr") or 0) // 1000), 30)
+    except Exception:
+        pass
+    try:
+        score += min(int(float(event.get("liquidity") or 0) // 500), 30)
+    except Exception:
+        pass
     return score
 
 
 def fetch_pm_event_data_active(coin: str, tf: str) -> dict | None:
     try:
-        data = requests.get(
-            config.PM_GAMMA,
-            params={"active": "true", "closed": "false", "limit": 100},
-            timeout=8,
-        ).json()
-        if not isinstance(data, list):
-            return None
+        now_utc = datetime.now(timezone.utc)
+        candidates: list[dict] = []
+        limit = int(os.getenv("PM_DISCOVERY_LIMIT", "100"))
+        max_pages = int(os.getenv("PM_DISCOVERY_MAX_PAGES", "5"))
+        for page in range(max_pages):
+            offset = page * limit
+            params = {
+                "active": "true",
+                "closed": "false",
+                "limit": limit,
+                "offset": offset,
+                "order": "end_date",
+                "ascending": "true",
+            }
+            data = requests.get(config.PM_GAMMA, params=params, timeout=8).json()
+            if not isinstance(data, list) or not data:
+                break
 
-        candidates = [e for e in data if _score_active_event_for_tf(e, coin, tf) > 0]
+            for event in data:
+                score = _score_active_event_for_tf(event, coin, tf, now_utc)
+                if score <= 0:
+                    continue
+                start_dt, end_dt = _extract_event_window(event)
+                if end_dt and end_dt < (now_utc - timedelta(minutes=5)):
+                    continue
+                event = dict(event)
+                event["_pm_score"] = score
+                event["_pm_start_dt"] = start_dt.isoformat() if start_dt else None
+                event["_pm_end_dt"] = end_dt.isoformat() if end_dt else None
+                candidates.append(event)
+
+            if len(data) < limit:
+                break
+
         if not candidates:
             return None
 
         candidates.sort(
             key=lambda e: (
-                _score_active_event_for_tf(e, coin, tf),
-                str(e.get("ticker") or e.get("slug") or ""),
-            ),
-            reverse=True,
+                -int(e.get("_pm_score") or 0),
+                str(e.get("_pm_end_dt") or "9999-12-31T23:59:59+00:00"),
+            )
         )
-        return candidates[0]
+        best = candidates[0]
+        print(
+            " [PM] active discovery selected "
+            f"slug={best.get('ticker') or best.get('slug')} "
+            f"score={best.get('_pm_score')} end={best.get('_pm_end_dt')}"
+        )
+        return best
     except Exception as e:
         print(f" [PM] active market discovery failed: {e}")
         return None
 
 
 def fetch_pm_event_data(coin: str, tf: str) -> dict | None:
+    # Fast-resolving windows like 5m/15m/4h should prefer active discovery first;
+    # slug guesses are often stale a few minutes after a round rolls.
+    if tf in {"5m", "15m", "4h"}:
+        event = fetch_pm_event_data_active(coin, tf)
+        if event:
+            return event
+
     for slug in _candidate_slugs(coin, tf):
         event = fetch_pm_event_data_by_slug(slug)
         if event:
             return event
 
-    event = fetch_pm_event_data_active(coin, tf)
-    if event is None:
-        print(f" [PM] no active market for {coin} {tf}")
-    return event
+    if tf not in {"5m", "15m", "4h"}:
+        event = fetch_pm_event_data_active(coin, tf)
+        if event:
+            return event
+
+    print(f" [PM] no active market for {coin} {tf}")
+    return None
 
 
 def fetch_pm_tokens(coin: str, tf: str) -> tuple[str | None, str | None]:
