@@ -6,6 +6,7 @@ Real Trading Module - With correct price limits
 import asyncio
 import json
 import os
+import time
 from datetime import datetime
 from typing import Optional, Dict, Any
 from dotenv import load_dotenv
@@ -34,22 +35,6 @@ MAX_TRADES_PER_DAY = 100  # Unlimited trades
 # Global lock untuk mencegah race condition
 _trade_lock = asyncio.Lock()
 
-# Feed state tracking untuk validasi TP/SL
-_feed_state = {
-    'valid': True,
-    'last_valid_price': {},
-    'last_update_ts': {},
-    'refreshing': False,
-    'pending_tp_sl': {},  # 2-step confirmation buffer
-}
-
-# Price validation constants
-MIN_VALID_PRICE = 0.01
-MAX_VALID_PRICE = 0.99
-MAX_PRICE_JUMP_ABS = 0.25  # Reject if price jumps >0.25 in single poll
-MAX_PRICE_CHANGE_PCT = 50  # Reject if price changes >50% in seconds
-SUSPICIOUS_VALUES = [0.0, 1.0]  # Reject exact 0 or 1 (resolution only)
-
 
 def _env_bool(name: str, default: bool = False) -> bool:
     value = os.getenv(name)
@@ -67,145 +52,10 @@ DOWN_SCORE_MIN = float(os.getenv("DOWN_SCORE_MIN", "0"))
 DOWN_SCORE_MAX = float(os.getenv("DOWN_SCORE_MAX", "25"))
 ALLOW_NEUTRAL_TREND = _env_bool("ALLOW_NEUTRAL_TREND", False)
 KEEP_POSITION_OPEN_ON_FAILED_LIVE_CLOSE = _env_bool("KEEP_POSITION_OPEN_ON_FAILED_LIVE_CLOSE", True)
-
-def validate_price(current: float, previous: float, symbol: str) -> tuple[bool, str]:
-    """Validate price to detect corrupt/invalid feed data.
-    
-    Returns: (is_valid, reason)
-    """
-    # Check for None/NaN
-    if current is None or current != current:  # NaN check
-        return False, "Price is None or NaN"
-    
-    # Check bounds
-    if current <= MIN_VALID_PRICE:
-        return False, f"Price {current:.4f} below minimum {MIN_VALID_PRICE}"
-    if current >= MAX_VALID_PRICE:
-        return False, f"Price {current:.4f} above maximum {MAX_VALID_PRICE}"
-    
-    # Check suspicious exact values (0.0 or 1.0)
-    if current in SUSPICIOUS_VALUES:
-        return False, f"Price {current} is suspicious (exact resolution value)"
-    
-    # Check extreme jumps
-    if previous and previous > 0:
-        abs_change = abs(current - previous)
-        pct_change = (abs_change / previous) * 100
-        
-        if abs_change > MAX_PRICE_JUMP_ABS:
-            return False, f"Price jump too large: {abs_change:.4f} ({pct_change:.1f}%)"
-        if pct_change > MAX_PRICE_CHANGE_PCT:
-            return False, f"Price change too extreme: {pct_change:.1f}%"
-    
-    return True, ""
-
-
-def set_feed_valid(valid: bool, reason: str = ""):
-    """Set feed validation state. Call this when feed becomes invalid/valid."""
-    global _feed_state
-    old_valid = _feed_state['valid']
-    _feed_state['valid'] = valid
-    _feed_state['refreshing'] = not valid
-    
-    if not valid and old_valid:
-        print(f"[FEED] Marked INVALID: {reason}", flush=True)
-    elif valid and not old_valid:
-        print(f"[FEED] Marked VALID: {reason}", flush=True)
-        # Clear pending TP/SL on revalidation
-        _feed_state['pending_tp_sl'] = {}
-
-
-def is_feed_valid() -> bool:
-    """Check if feed is currently valid for TP/SL decisions."""
-    return _feed_state['valid'] and not _feed_state['refreshing']
-
-
-def update_price_tracking(symbol: str, price: float):
-    """Update price tracking with validation."""
-    global _feed_state
-    
-    previous = _feed_state['last_valid_price'].get(symbol)
-    is_valid, reason = validate_price(price, previous, symbol)
-    
-    if is_valid:
-        _feed_state['last_valid_price'][symbol] = price
-        _feed_state['last_update_ts'][symbol] = datetime.now()
-        if not _feed_state['valid']:
-            set_feed_valid(True, f"Valid price received for {symbol}")
-    else:
-        print(f"[PRICE REJECTED] {symbol}: {reason}", flush=True)
-    
-    return is_valid
-
-
-def check_tp_sl_with_confirmation(symbol: str, side: str, current_price: float, 
-                                   entry_price: float, sl_price: float, tp_price: float) -> tuple[bool, str, float]:
-    """2-step confirmation for TP/SL to avoid fakeouts from bad data.
-    
-    Returns: (should_close, reason, confirmed_price)
-    """
-    global _feed_state
-    
-    # Don't check if feed invalid
-    if not is_feed_valid():
-        return False, "Feed invalid", current_price
-    
-    # Validate current price
-    previous = _feed_state['last_valid_price'].get(symbol)
-    is_valid, reject_reason = validate_price(current_price, previous, symbol)
-    
-    if not is_valid:
-        return False, f"Price validation failed: {reject_reason}", current_price
-    
-    # Check for trigger condition
-    trigger_key = f"{symbol}_{side}"
-    pending = _feed_state['pending_tp_sl'].get(trigger_key)
-    
-    if side == 'UP':
-        if current_price >= tp_price:
-            condition = 'TP'
-        elif current_price <= sl_price:
-            condition = 'SL'
-        else:
-            # Clear any pending state
-            if trigger_key in _feed_state['pending_tp_sl']:
-                del _feed_state['pending_tp_sl'][trigger_key]
-            return False, "", current_price
-    else:  # DOWN
-        if current_price >= tp_price:
-            condition = 'TP'
-        elif current_price <= sl_price:
-            condition = 'SL'
-        else:
-            if trigger_key in _feed_state['pending_tp_sl']:
-                del _feed_state['pending_tp_sl'][trigger_key]
-            return False, "", current_price
-    
-    # 2-step confirmation
-    if pending and pending['condition'] == condition:
-        # Second confirmation received
-        time_since_first = (datetime.now() - pending['timestamp']).total_seconds()
-        if time_since_first < 5:  # Within 5 seconds
-            print(f"[2-STEP CONFIRMED] {symbol} {side} {condition} | "
-                  f"First: {pending['price']:.4f}, Now: {current_price:.4f} | "
-                  f"Latency: {time_since_first:.1f}s", flush=True)
-            del _feed_state['pending_tp_sl'][trigger_key]
-            return True, condition, current_price
-        else:
-            # Stale confirmation, reset
-            del _feed_state['pending_tp_sl'][trigger_key]
-    
-    # First trigger, mark as pending
-    _feed_state['pending_tp_sl'][trigger_key] = {
-        'condition': condition,
-        'price': current_price,
-        'timestamp': datetime.now()
-    }
-    print(f"[PENDING CONFIRMATION] {symbol} {side} {condition} @ {current_price:.4f} "
-          f"(waiting for 2nd confirmation)", flush=True)
-    
-    return False, "pending_confirmation", current_price
-
+EXIT_CONFIRMATIONS_REQUIRED = int(os.getenv("EXIT_CONFIRMATIONS_REQUIRED", "2"))
+EXIT_MAX_PRICE_JUMP_ABS = float(os.getenv("EXIT_MAX_PRICE_JUMP_ABS", "0.20"))
+EXIT_MAX_PRICE_JUMP_REL = float(os.getenv("EXIT_MAX_PRICE_JUMP_REL", "0.50"))
+EXIT_MAX_QUOTE_AGE_SEC = float(os.getenv("EXIT_MAX_QUOTE_AGE_SEC", "15"))
 
 def get_price_limits(score: float):
     """Static price limits for the current expectancy-optimized setup.
@@ -424,6 +274,111 @@ class RealTrader:
             print(f"[TREND GET ERROR] {e}", flush=True)
             return "NEUTRAL"
     
+    def _reset_pending_exit(self, symbol: str):
+        self.pending_exit_checks.pop(symbol, None)
+
+    def _record_valid_quote(self, pos: Dict[str, Any], current_price: float):
+        pos['last_valid_price'] = float(current_price)
+        pos['last_valid_quote_ts'] = time.time()
+
+    def _validate_exit_quote(
+        self,
+        symbol: str,
+        pos: Dict[str, Any],
+        current_price: float,
+        side: str,
+        market_meta: Optional[Dict[str, Any]] = None,
+    ) -> tuple[bool, str]:
+        try:
+            price = float(current_price)
+        except (TypeError, ValueError):
+            self._reset_pending_exit(symbol)
+            return False, f"non-numeric price: {current_price!r}"
+
+        if price <= 0.0 or price >= 1.0:
+            self._reset_pending_exit(symbol)
+            return False, f"invalid binary-market price: {price:.4f}"
+
+        side_prefix = 'pm_up' if side == 'UP' else 'pm_dn'
+        if market_meta:
+            if market_meta.get('guard_active'):
+                self._reset_pending_exit(symbol)
+                return False, market_meta.get('guard_reason', 'feed guard active')
+
+            if not market_meta.get(f'{side_prefix}_valid', False):
+                self._reset_pending_exit(symbol)
+                return False, f"{side} quote invalid during refresh"
+
+            quote_age = market_meta.get('quote_age_sec')
+            max_age = market_meta.get('max_quote_age_sec', EXIT_MAX_QUOTE_AGE_SEC)
+            if quote_age is not None and quote_age > max_age:
+                self._reset_pending_exit(symbol)
+                return False, f"stale quote age {quote_age:.1f}s > {max_age:.1f}s"
+
+            active_token_id = market_meta.get(f'{side_prefix}_token_id')
+            position_token_id = pos.get('token_id')
+            if position_token_id and active_token_id and position_token_id != active_token_id:
+                self._reset_pending_exit(symbol)
+                return False, (
+                    f"token changed for {symbol}: pos={position_token_id} active={active_token_id}"
+                )
+
+            reference_price = market_meta.get(f'{side_prefix}_last_good')
+        else:
+            reference_price = None
+
+        if reference_price is None:
+            reference_price = pos.get('last_valid_price') or pos.get('entry_price')
+
+        try:
+            reference_price = float(reference_price)
+        except (TypeError, ValueError):
+            reference_price = float(pos.get('entry_price', price))
+
+        abs_jump = abs(price - reference_price)
+        rel_jump = abs_jump / reference_price if reference_price > 0 else 0.0
+        if abs_jump > EXIT_MAX_PRICE_JUMP_ABS and rel_jump > EXIT_MAX_PRICE_JUMP_REL:
+            self._reset_pending_exit(symbol)
+            return False, (
+                f"suspicious price jump {reference_price:.4f} -> {price:.4f} "
+                f"(|Δ|={abs_jump:.4f}, rel={rel_jump:.1%})"
+            )
+
+        self._record_valid_quote(pos, price)
+        return True, "ok"
+
+    def _confirm_exit_trigger(
+        self,
+        symbol: str,
+        reason: str,
+        current_price: float,
+    ) -> tuple[bool, int]:
+        if EXIT_CONFIRMATIONS_REQUIRED <= 1:
+            self._reset_pending_exit(symbol)
+            return True, 1
+
+        pending = self.pending_exit_checks.get(symbol)
+        now_ts = time.time()
+        if pending and pending.get('reason') == reason:
+            pending['count'] = int(pending.get('count', 1)) + 1
+            pending['price'] = float(current_price)
+            pending['updated_at'] = now_ts
+        else:
+            pending = {
+                'reason': reason,
+                'count': 1,
+                'price': float(current_price),
+                'created_at': now_ts,
+                'updated_at': now_ts,
+            }
+            self.pending_exit_checks[symbol] = pending
+
+        if pending['count'] >= EXIT_CONFIRMATIONS_REQUIRED:
+            self._reset_pending_exit(symbol)
+            return True, pending['count']
+
+        return False, pending['count']
+
     async def check_signal(
         self,
         symbol: str,
@@ -632,6 +587,9 @@ class RealTrader:
             'token_id': token_id,
             'mode': mode,
             'trend_direction': trend_direction,
+            'entry_round': candle_round,
+            'last_valid_price': price,
+            'last_valid_quote_ts': time.time(),
         }
 
         self._save_state()
@@ -667,7 +625,9 @@ class RealTrader:
         try:
             from polymarket_executor import PolymarketExecutor
             self.executor = PolymarketExecutor()
-            await self.executor.initialize()
+            init_ok = await self.executor.initialize()
+            if not init_ok:
+                raise RuntimeError("executor.initialize() returned False")
             _global_executor = self.executor
             _global_executor_initialized = True
             self.executor_ready = True
@@ -678,14 +638,15 @@ class RealTrader:
             self.executor_ready = False
             return False
     
-    async def check_sl_tp(self, symbol: str, pm_up_price: float = 0.0, pm_down_price: float = 0.0):
-        """Check SL/TP for existing positions with validation and 2-step confirmation."""
+    async def check_sl_tp(
+        self,
+        symbol: str,
+        pm_up_price: float = 0.0,
+        pm_down_price: float = 0.0,
+        market_meta: Optional[Dict[str, Any]] = None,
+    ):
+        """Check SL/TP for existing positions with feed-safety guards."""
         if symbol not in self.positions:
-            return None
-
-        # Don't check TP/SL if feed is invalid
-        if not is_feed_valid():
-            print(f"[TP/SL PAUSED] {symbol}: Feed invalid or refreshing", flush=True)
             return None
 
         pos = self.positions[symbol]
@@ -700,47 +661,55 @@ class RealTrader:
 
         sl_distance = entry_price * (sl_pct / 100)
         tp_distance = entry_price * (tp_pct / 100)
-        
-        # Get current price for the side
+
         if side == 'UP':
-            current_price = pm_up_price
             sl_price = entry_price - sl_distance
             tp_price = entry_price + tp_distance
-        else:  # DOWN
+            current_price = pm_up_price
+            stop_hit = current_price <= sl_price
+            take_hit = current_price >= tp_price
+        else:
+            sl_price = entry_price - sl_distance
+            tp_price = entry_price + tp_distance
             current_price = pm_down_price
-            sl_price = entry_price + sl_distance  # For DOWN, price going up = loss
-            tp_price = entry_price - tp_distance   # For DOWN, price going down = win
-        
-        # Validate price before any TP/SL check
-        is_valid, reject_reason = validate_price(current_price, 
-                                                  _feed_state['last_valid_price'].get(symbol),
-                                                  symbol)
-        if not is_valid:
-            print(f"[SKIP TP/SL CHECK] {symbol}: {reject_reason}", flush=True)
-            return None
-        
-        # Update price tracking
-        update_price_tracking(symbol, current_price)
-        
-        # Check for TP/SL with 2-step confirmation
-        should_close, reason, confirmed_price = check_tp_sl_with_confirmation(
-            symbol, side, current_price, entry_price, sl_price, tp_price
+            stop_hit = current_price <= sl_price
+            take_hit = current_price >= tp_price
+
+        is_quote_valid, quote_reason = self._validate_exit_quote(
+            symbol=symbol,
+            pos=pos,
+            current_price=current_price,
+            side=side,
+            market_meta=market_meta,
         )
-        
-        if should_close:
-            if reason == 'TP':
-                print(f"[TP CONFIRMED] {symbol} {side} | Entry: {entry_price:.4f} | "
-                      f"Confirmed: {confirmed_price:.4f} | TP: {tp_price:.4f}", flush=True)
-                return await self._close_position_sl(symbol, confirmed_price, 'TAKE_PROFIT', sl_pct, tp_pct)
-            elif reason == 'SL':
-                print(f"[SL CONFIRMED] {symbol} {side} | Entry: {entry_price:.4f} | "
-                      f"Confirmed: {confirmed_price:.4f} | SL: {sl_price:.4f}", flush=True)
-                return await self._close_position_sl(symbol, confirmed_price, 'STOP_LOSS', sl_pct, tp_pct)
-        
-        return None
-    
+        if not is_quote_valid:
+            print(f"[EXIT GUARD] {symbol} {side} quote rejected: {quote_reason}", flush=True)
+            return None
+
+        if not stop_hit and not take_hit:
+            self._reset_pending_exit(symbol)
+            return None
+
+        reason = 'STOP_LOSS' if stop_hit else 'TAKE_PROFIT'
+        trigger_price = sl_price if stop_hit else tp_price
+        confirmed, seen_count = self._confirm_exit_trigger(symbol, reason, current_price)
+        if not confirmed:
+            print(
+                f"[EXIT PENDING] {symbol} {side} {reason} seen {seen_count}/{EXIT_CONFIRMATIONS_REQUIRED} | "
+                f"Entry: {entry_price:.4f} | Current: {current_price:.4f} | Trigger: {trigger_price:.4f}",
+                flush=True,
+            )
+            return None
+
+        print(
+            f"[{reason}] {symbol} {side} confirmed {seen_count}/{EXIT_CONFIRMATIONS_REQUIRED} | "
+            f"Entry: {entry_price:.4f} | Current: {current_price:.4f} | Trigger: {trigger_price:.4f}",
+            flush=True,
+        )
+        return await self._close_position_sl(symbol, current_price, reason, sl_pct, tp_pct)
+
     async def _close_position_sl(self, symbol: str, current_price: float, reason: str,
-                           sl_pct: float = 15.0, tp_pct: float = 30.0) -> Dict[str, Any]:
+                           sl_pct: float = 20.0, tp_pct: float = 40.0) -> Dict[str, Any]:
         """Close position with specified reason (SL or TP)."""
         global _trade_lock
         async with _trade_lock:
@@ -749,6 +718,7 @@ class RealTrader:
                 return None
 
             pos = self.positions[symbol]
+            self._reset_pending_exit(symbol)
             side = pos['side']
             entry_price = pos['entry_price']
             size = pos['size']
@@ -881,7 +851,7 @@ class RealTrader:
         
         if trade['action'] == 'OPEN':
             trade_mode = trade.get('mode', 'DRY-RUN')
-            header = f"{emoji} <b>{trade_mode} ENTRY EXECUTED</b> {emoji}"
+            header = f"{emoji} <b>{trade_mode} TRADE - OPEN</b> {emoji}"
         elif trade.get('reason') == 'STOP_LOSS':
             header = f"⚠️ <b>STOP LOSS TRIGGERED</b> ⚠️"
             emoji = "🛑"
@@ -901,7 +871,7 @@ class RealTrader:
 {header}
 
 📊 Symbol: <code>{trade['symbol']}</code>
-📥 Entry: <b>{trade['side']}</b> token
+📥 {trade['action']}: <b>{trade['side']}</b> token
 💵 Price: {price:.4f}
 📏 Size: {trade['size']:.2f}
 """
@@ -924,9 +894,8 @@ class RealTrader:
             
             conf = "🔥 SUPER YAKIN" if score >= 90 else "✅ SWEET SPOT" if 75 <= score <= 80 else "⚠️ FILTERED"
             text += f"\n{conf} (Score: {score})\n"
-            text += f"💵 Entry Price: {entry:.4f}\n"
-            text += f"🛑 Stop Loss: {sl_price:.4f} ({sl_pct:.0f}%)\n"
-            text += f"🎯 Take Profit: {tp_price:.4f} ({tp_pct:.0f}%)\n"
+            text += f"🛑 SL: {sl_price:.4f} ({sl_pct:.0f}%)\n"
+            text += f"🎯 TP: {tp_price:.4f} ({tp_pct:.0f}%)\n"
             text += f"📊 RR: 1:{tp_pct/sl_pct:.1f}\n"
                 
         if 'pnl' in trade:
