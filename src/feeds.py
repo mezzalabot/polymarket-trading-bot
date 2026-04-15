@@ -447,10 +447,18 @@ def fetch_pm_tokens_robust(coin: str, tf: str) -> tuple[str | None, str | None, 
 
 
 async def _pm_heartbeat(ws, state: State):
-    while True:
-        await asyncio.sleep(PM_HEARTBEAT_SEC)
-        await ws.send("PING")
-        state.pm_last_pong_ts = time.time()
+    try:
+        while True:
+            try:
+                await asyncio.sleep(PM_HEARTBEAT_SEC)
+                await ws.send("PING")
+                state.pm_last_pong_ts = time.time()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                break
+    except asyncio.CancelledError:
+        pass
 
 
 def _pm_reset_quotes(state: State):

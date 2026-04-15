@@ -434,59 +434,79 @@ class RealTrader:
             if not trend_direction:
                 trend_direction = self._get_current_trend(symbol)
 
+            # Detailed check for why entry was skipped
+            skip_reasons = []
+            
             up_score_ok = ENABLE_UP_ENTRIES and UP_SCORE_MIN <= score <= UP_SCORE_MAX
             down_score_ok = ENABLE_DOWN_ENTRIES and DOWN_SCORE_MIN <= score <= DOWN_SCORE_MAX
-
-            if up_score_ok and pm_up_price >= min_entry and pm_up_price <= max_up:
-                is_valid, reason = get_entry_price_filter("UP", pm_up_price)
-                if not is_valid:
-                    print(f"[ENTRY FILTER] {reason}", flush=True)
-                    return None
-
-                trend_ok, trend_reason = check_trend_filter("UP", trend_direction)
-                if not trend_ok:
-                    print(f"[TREND FILTER] {trend_reason}", flush=True)
-                    return None
-
-                print(f"[TREND CONFIRM] {trend_reason}", flush=True)
-                return await self._execute_real_trade(
-                    symbol,
-                    "UP",
-                    pm_up_price,
-                    score,
-                    candle_round=candle_round,
-                    token_id=pm_up_token_id,
-                    trend_direction=trend_direction,
-                )
-
-            if down_score_ok and pm_down_price >= min_entry and pm_down_price <= max_down and pm_down_price >= min_down:
-                is_valid, reason = get_entry_price_filter("DOWN", pm_down_price)
-                if not is_valid:
-                    print(f"[ENTRY FILTER] {reason}", flush=True)
-                    return None
-
-                trend_ok, trend_reason = check_trend_filter("DOWN", trend_direction)
-                if not trend_ok:
-                    print(f"[TREND FILTER] {trend_reason}", flush=True)
-                    return None
-
-                print(f"[TREND CONFIRM] {trend_reason}", flush=True)
-                return await self._execute_real_trade(
-                    symbol,
-                    "DOWN",
-                    pm_down_price,
-                    score,
-                    candle_round=candle_round,
-                    token_id=pm_down_token_id,
-                    trend_direction=trend_direction,
-                )
-
-            print(
-                f"[SKIP] Score {score} outside allowed bands | "
-                f"UP={UP_SCORE_MIN}-{UP_SCORE_MAX} enabled={ENABLE_UP_ENTRIES} | "
-                f"DOWN={DOWN_SCORE_MIN}-{DOWN_SCORE_MAX} enabled={ENABLE_DOWN_ENTRIES}",
-                flush=True,
-            )
+            
+            # Check UP entry conditions
+            if ENABLE_UP_ENTRIES:
+                if not up_score_ok:
+                    skip_reasons.append(f"UP score {score} outside [{UP_SCORE_MIN}-{UP_SCORE_MAX}]")
+                elif pm_up_price < min_entry:
+                    skip_reasons.append(f"UP price {pm_up_price:.2f} < min {min_entry}")
+                elif pm_up_price > max_up:
+                    skip_reasons.append(f"UP price {pm_up_price:.2f} > max {max_up}")
+                else:
+                    # Price OK, check entry filter
+                    is_valid, reason = get_entry_price_filter("UP", pm_up_price)
+                    if not is_valid:
+                        skip_reasons.append(f"UP {reason}")
+                    else:
+                        # Check trend
+                        trend_ok, trend_reason = check_trend_filter("UP", trend_direction)
+                        if not trend_ok:
+                            skip_reasons.append(f"UP trend filter: {trend_reason}")
+                        else:
+                            print(f"[TREND CONFIRM] {trend_reason}", flush=True)
+                            return await self._execute_real_trade(
+                                symbol,
+                                "UP",
+                                pm_up_price,
+                                score,
+                                candle_round=candle_round,
+                                token_id=pm_up_token_id,
+                                trend_direction=trend_direction,
+                            )
+            
+            # Check DOWN entry conditions
+            if ENABLE_DOWN_ENTRIES:
+                if not down_score_ok:
+                    skip_reasons.append(f"DOWN score {score} outside [{DOWN_SCORE_MIN}-{DOWN_SCORE_MAX}]")
+                elif pm_down_price < min_entry:
+                    skip_reasons.append(f"DOWN price {pm_down_price:.2f} < min {min_entry}")
+                elif pm_down_price > max_down:
+                    skip_reasons.append(f"DOWN price {pm_down_price:.2f} > max {max_down}")
+                elif pm_down_price < min_down:
+                    skip_reasons.append(f"DOWN price {pm_down_price:.2f} < min_down {min_down}")
+                else:
+                    # Price OK, check entry filter
+                    is_valid, reason = get_entry_price_filter("DOWN", pm_down_price)
+                    if not is_valid:
+                        skip_reasons.append(f"DOWN {reason}")
+                    else:
+                        # Check trend
+                        trend_ok, trend_reason = check_trend_filter("DOWN", trend_direction)
+                        if not trend_ok:
+                            skip_reasons.append(f"DOWN trend filter: {trend_reason}")
+                        else:
+                            print(f"[TREND CONFIRM] {trend_reason}", flush=True)
+                            return await self._execute_real_trade(
+                                symbol,
+                                "DOWN",
+                                pm_down_price,
+                                score,
+                                candle_round=candle_round,
+                                token_id=pm_down_token_id,
+                                trend_direction=trend_direction,
+                            )
+            
+            # Print detailed skip reason
+            if skip_reasons:
+                print(f"[SKIP] {' | '.join(skip_reasons)}", flush=True)
+            else:
+                print(f"[SKIP] No valid entry conditions met (UP enabled={ENABLE_UP_ENTRIES}, DOWN enabled={ENABLE_DOWN_ENTRIES})", flush=True)
             return None
 
     async def _execute_real_trade(
