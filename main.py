@@ -261,7 +261,7 @@ async def display_loop(state: feeds.State, trend_state: feeds.State, coin: str, 
                 now_et = datetime.now(et_tz)
                 candle_round, start_hour, end_hour, ampm, time_left = _build_candle_round(now_et)
 
-                if direction == "NEUTRAL" and dash_state.should_notify_neutral(coin, tf) and TELEGRAM_ENABLED:
+                if dash_state.should_notify_neutral(coin, tf) and TELEGRAM_ENABLED:
                     try:
                         status = paper_trader.get_status()
                         if state.pm_up is None:
