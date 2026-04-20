@@ -27,13 +27,18 @@ async def send_message(text: str):
     if not _enabled():
         print("[Telegram] Notifier disabled - token or chat_id not set", flush=True)
         return False
-    session = await _get_session()
-    payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
-    async with session.post(f"{BASE_URL}/sendMessage", data=payload) as resp:
-        if resp.status != 200:
-            body = await resp.text()
-            raise RuntimeError(f"Telegram API {resp.status}: {body}")
-        return True
+    try:
+        session = await _get_session()
+        payload = {"chat_id": CHAT_ID, "text": text, "parse_mode": "HTML", "disable_web_page_preview": True}
+        async with session.post(f"{BASE_URL}/sendMessage", data=payload) as resp:
+            if resp.status != 200:
+                body = await resp.text()
+                print(f"[Telegram] API error {resp.status}: {body[:100]}", flush=True)
+                return False
+            return True
+    except Exception as e:
+        print(f"[Telegram] Send failed: {e}", flush=True)
+        return False
 
 async def send_signal_alert(symbol: str, timeframe: str, side: str, score: float, trend_direction: str, price: float, candle_round: str):
     emoji = "🟢" if side == "UP" else "🔴"

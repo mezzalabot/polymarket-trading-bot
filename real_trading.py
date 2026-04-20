@@ -188,6 +188,9 @@ class RealTrader:
         # Track entry round to prevent multiple entries in same candle
         self.last_entry_round: Optional[str] = None
         
+        # Exit confirmation tracking (for anti-fake TP/SL)
+        self.pending_exit_checks: Dict[str, Any] = {}
+        
         self._load_state()
         
         print(f"🚀 REAL TRADER INITIALIZED (v8 + TREND FILTER)")
@@ -195,7 +198,7 @@ class RealTrader:
         print(f"   🔗 Wallet: 0xc668...1D5A")
         print(f"   ⚡ Real Execution: READY")
         print(f"   📈 Trend Filter: ACTIVE (1H trend detection)")
-        print(f"   Trades Today: {self.trades_today}/4")
+        print(f"   Trades Cycle: {self.trades_today}/100 (auto-reset at 100)")
         print(f"   Price Limits: UP max 0.55, DOWN min 0.45")
     
     def _load_state(self):
@@ -403,11 +406,12 @@ class RealTrader:
                 f"match={self.last_entry_round == candle_round}",
                 flush=True,
             )
-            self._check_new_day()
-
+            # Check if we've reached 100 trades - if so, reset counter for continuous trading
             if self.trades_today >= MAX_TRADES_PER_DAY:
-                print(f"[SKIP] Max trades reached: {self.trades_today}/{MAX_TRADES_PER_DAY}", flush=True)
-                return None
+                print(f"[CYCLE COMPLETE] {self.trades_today}/100 trades done. Resetting counter...", flush=True)
+                self.trades_today = 0
+                self._save_state()
+                print(f"[RESET] Counter reset. Continuing trading...", flush=True)
 
             # Check if already entered this round (1 entry per round max)
             if candle_round and self.last_entry_round == candle_round:
@@ -973,10 +977,13 @@ class RealTrader:
         return text
     
     def _check_new_day(self):
+        # Daily check disabled - now using 100-trade cycle reset
+        # Only update last_trade_date for reference, don't reset counter
         today = datetime.now().strftime("%Y-%m-%d")
         if today != self.last_trade_date:
-            self.trades_today = 0
             self.last_trade_date = today
+            # Note: trades_today is NOT reset daily anymore
+            # It resets only when reaching MAX_TRADES_PER_DAY (100)
             self._save_state()
 
 real_trader = RealTrader()

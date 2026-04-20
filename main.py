@@ -261,8 +261,11 @@ async def display_loop(state: feeds.State, trend_state: feeds.State, coin: str, 
                 now_et = datetime.now(et_tz)
                 candle_round, start_hour, end_hour, ampm, time_left = _build_candle_round(now_et)
 
-                if dash_state.should_notify_neutral(coin, tf) and TELEGRAM_ENABLED:
+                should_notify = dash_state.should_notify_neutral(coin, tf)
+                print(f"[DEBUG] should_notify={should_notify}, TELEGRAM_ENABLED={TELEGRAM_ENABLED}, time_since_last={asyncio.get_event_loop().time() - dash_state.last_neutral_notify.get(f'{coin}_{tf}', 0):.0f}s", flush=True)
+                if should_notify and TELEGRAM_ENABLED:
                     try:
+                        print(f"[DEBUG] Sending monitoring notification...", flush=True)
                         status = paper_trader.get_status()
                         if state.pm_up is None:
                             pm_up_str = "⏳ Waiting data..."
@@ -311,12 +314,14 @@ async def display_loop(state: feeds.State, trend_state: feeds.State, coin: str, 
                             f"📡 Feed: {_pm_feed_label(state)}\n"
                             f"⏱️ Time Left: {time_left} min"
                             f"{position_info}\n"
-                            f"💰 Balance: ${status['balance']:.2f} | Trades: {status['trades_today']}/100 | PnL: ${status['total_pnl']:.2f}\n"
+                            f"💰 Balance: ${status['balance']:.2f} | Tahap 1B: {status['total_trades']}/20 | PnL: ${status['total_pnl']:.2f}\n"
                             f"🤖 Bot: RUNNING | ⏰ {current_time} ET"
                         )
                         dash_state.update_neutral_notify(coin, tf)
                     except Exception as e:
-                        print(f"[ERROR] Neutral notification failed: {e}", flush=True)
+                        print(f"[ERROR] Neutral notification failed: {type(e).__name__}: {e}", flush=True)
+                        # Continue even if notification fails - don't break trading
+                        pass
 
                 trade_executed = False
                 trade = None
@@ -392,10 +397,14 @@ async def display_loop(state: feeds.State, trend_state: feeds.State, coin: str, 
                                 print(f"[ERROR] Format trade alert failed: {e}", flush=True)
                                 alert_text = f"REAL TRADE: {trade.get('side')} {trade.get('action')} @ {trade.get('price',0):.4f}"
 
-                            await send_message(alert_text)
+                            try:
+                                await send_message(alert_text)
+                                print(f"[TELEGRAM] Entry notification SENT successfully", flush=True)
+                            except Exception as e:
+                                print(f"[TELEGRAM ERROR] Failed to send entry notification: {e}", flush=True)
 
                         dash_state.update_strong_notify(coin, tf)
-                        print(f"[NOTIFY SENT] Signal + Trade for {direction} {score} | HTF={trend_direction}", flush=True)
+                        print(f"[NOTIFY COMPLETE] Signal + Trade for {direction} {score} | HTF={trend_direction}", flush=True)
                     except Exception as e:
                         print(f"[ERROR] Notification failed: {e}", flush=True)
 
@@ -404,7 +413,7 @@ async def display_loop(state: feeds.State, trend_state: feeds.State, coin: str, 
                     status = paper_trader.get_status()
                     print(
                         f"[{now}] BTC={state.mid:,.0f} | Score={score:.0f} | {direction} | "
-                        f"HTF={trend_direction} | Trades={status['total_trades']} | PnL=${status['total_pnl']:.2f}",
+                        f"HTF={trend_direction} | Tahap1B={status['total_trades']}/20 | PnL=${status['total_pnl']:.2f}",
                         flush=True,
                     )
                 except Exception as e:
