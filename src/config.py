@@ -55,6 +55,9 @@ EMA_S      = 5
 EMA_L      = 20
 
 # ── Bias Score weights (max absolute contribution of each indicator) ──
+# ── Scoring Version ────────────────────────────────────────
+USE_SCORING_V2 = True   # Enable V2 scoring framework (Tahap 2)
+
 BIAS_WEIGHTS = {
     "ema":   10,   # EMA5/EMA20 cross  – strongest trend proxy
     "obi":    8,   # Order Book Imbalance

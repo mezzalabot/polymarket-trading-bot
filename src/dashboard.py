@@ -42,12 +42,22 @@ def calculate_trend_score(st):
     - 0-40 = Bearish
     - 45-55 = Neutral  
     - 60-100 = Bullish
+    
+    V2: Returns direct 0-100 score from scoring_v2
+    V1: Converts -10..+10 to 0..100
     """
-    score_val, label, _ = _score_trend(st)
-    # Convert from -10..+10 range to 0..100 range
-    # _score_trend returns: bullish >=3, bearish <=-3, neutral in between
-    # Map: -10 → 0, 0 → 50, +10 → 100
-    return 50 + (score_val * 5)
+    if config.USE_SCORING_V2:
+        from scoring_v2 import bias_score_v2
+        score, details = bias_score_v2(st.bids, st.asks, st.mid, st.trades, st.klines)
+        # Store details for debugging
+        st.score_v2_details = details
+        return score  # Already 0-100
+    else:
+        score_val, label, _ = _score_trend(st)
+        # Convert from -10..+10 range to 0..100 range
+        # _score_trend returns: bullish >=3, bearish <=-3, neutral in between
+        # Map: -10 → 0, 0 → 50, +10 → 100
+        return 50 + (score_val * 5)
 
 
 def _score_trend(st):
@@ -115,7 +125,16 @@ def _bias_display(bias: float) -> tuple[str, str, str]:
 
 def _header(st, coin, tf):
     score, label, col = _score_trend(st)
-    bias = ind.bias_score(st.bids, st.asks, st.mid, st.trades, st.klines)
+    
+    # Use V2 scoring if enabled
+    if config.USE_SCORING_V2:
+        from scoring_v2 import bias_score_v2
+        bias, details = bias_score_v2(st.bids, st.asks, st.mid, st.trades, st.klines)
+        # Store details for debugging
+        st.score_v2_details = details
+    else:
+        bias = ind.bias_score(st.bids, st.asks, st.mid, st.trades, st.klines)
+    
     b_label, b_pct, b_col = _bias_display(bias)
 
     parts = [
@@ -342,7 +361,14 @@ def _signals_panel(st):
         sigs.append("[dim]No active signals[/dim]")
 
     score, label, col = _score_trend(st)
-    bias = ind.bias_score(st.bids, st.asks, st.mid, st.trades, st.klines)
+    
+    # Use V2 scoring if enabled
+    if config.USE_SCORING_V2:
+        from scoring_v2 import bias_score_v2
+        bias, details = bias_score_v2(st.bids, st.asks, st.mid, st.trades, st.klines)
+    else:
+        bias = ind.bias_score(st.bids, st.asks, st.mid, st.trades, st.klines)
+    
     b_label, b_pct, b_col = _bias_display(bias)
 
     # ── TREND bar (qualitative) ─────────────────────────────────
