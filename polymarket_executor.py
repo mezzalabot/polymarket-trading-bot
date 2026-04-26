@@ -10,22 +10,24 @@ import requests
 from decimal import Decimal
 from dotenv import load_dotenv
 
-# CRITICAL: Monkey-patch BEFORE importing anything from py_clob_client
-# The library's order_to_json() calls order.dict() which doesn't exist on OrderArgs
-from py_clob_client.clob_types import OrderArgs as _OrderArgs
-if not hasattr(_OrderArgs, 'dict'):
-    def _order_args_dict(self):
-        return self.__dict__
-    _OrderArgs.dict = _order_args_dict
-    print("🩹 Monkey-patch applied: OrderArgs.dict() -> __dict__")
-
-# Now safe to import the rest
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
+# V2 Migration (April 28, 2026)
+# py-clob-client → py-clob-client-v2
+# No more monkey-patch needed — V2 SDK is clean
+try:
+    from py_clob_client_v2.client import ClobClient
+    from py_clob_client_v2.clob_types import ApiCreds, OrderArgs, OrderType
+    CLOB_V2 = True
+    print("✅ Using py-clob-client-v2 (CLOB V2)")
+except ImportError:
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import ApiCreds, OrderArgs, OrderType
+    CLOB_V2 = False
+    print("⚠️ Falling back to py-clob-client V1")
 
 load_dotenv()
 
 # API Endpoints
+# V2 test endpoint available now; production URL stays the same after April 28 cutover
 CLOB_HOST = "https://clob.polymarket.com"
 RELAYER_HOST = "https://relayer-v2.polymarket.com"
 CHAIN_ID = 137  # Polygon mainnet
@@ -69,7 +71,7 @@ class PolymarketExecutor:
                 host=CLOB_HOST,
                 chain_id=CHAIN_ID,
                 key=self.private_key,
-                signature_type=SIGNATURE_TYPE_EOA  # 0 = EOA
+                signature_type=SIGNATURE_TYPE_EOA,  # 0 = EOA
             )
             
             # Create or derive API credentials (L2 auth)
@@ -82,7 +84,7 @@ class PolymarketExecutor:
                 chain_id=CHAIN_ID,
                 key=self.private_key,
                 creds=self.api_creds,
-                signature_type=SIGNATURE_TYPE_EOA  # Keep EOA
+                signature_type=SIGNATURE_TYPE_EOA,  # Keep EOA
             )
             
             self.initialized = True
@@ -153,9 +155,10 @@ class PolymarketExecutor:
             return None
         
         try:
-            from py_clob_client.clob_types import CreateOrderOptions
-            from py_clob_client.order_builder.builder import OrderBuilder
-            from py_clob_client.signer import Signer
+            if CLOB_V2:
+                from py_clob_client_v2.clob_types import CreateOrderOptions
+            else:
+                from py_clob_client.clob_types import CreateOrderOptions
             
             print(f"📤 Placing MARKET {side} order: {size} shares @ {price or 'market'}")
             print(f"   → Token: {token_id[:20]}...")
@@ -169,16 +172,26 @@ class PolymarketExecutor:
             print(f"   → Size: {size} → rounded: {rounded_size} (2 decimals)")
             print(f"   → Price: {price} → rounded: {rounded_price} (5 decimals)")
             
-            order_args = OrderArgs(
-                token_id=str(token_id),
-                side=side.upper(),
-                size=rounded_size,
-                price=rounded_price,
-                fee_rate_bps=0,  # Market taker fee is 0 for this market
-                nonce=0,
-                expiration=0,
-                taker='0x0000000000000000000000000000000000000000'
-            )
+            if CLOB_V2:
+                # V2: no fee_rate_bps, nonce, taker
+                order_args = OrderArgs(
+                    token_id=str(token_id),
+                    side=side.upper(),
+                    size=rounded_size,
+                    price=rounded_price,
+                )
+            else:
+                # V1 fallback
+                order_args = OrderArgs(
+                    token_id=str(token_id),
+                    side=side.upper(),
+                    size=rounded_size,
+                    price=rounded_price,
+                    fee_rate_bps=0,
+                    nonce=0,
+                    expiration=0,
+                    taker='0x0000000000000000000000000000000000000000'
+                )
             
             # Create order options
             options = CreateOrderOptions(tick_size="0.01", neg_risk=False)
