@@ -43,7 +43,7 @@ def calculate_trend_score(st):
     - 45-55 = Neutral  
     - 60-100 = Bullish
     
-    V2: Returns direct 0-100 score from scoring_v2
+    V2.1: Returns direct 0-100 score from scoring_v2 (bidirectional)
     V1: Converts -10..+10 to 0..100
     """
     if config.USE_SCORING_V2:
@@ -51,6 +51,13 @@ def calculate_trend_score(st):
         score, details = bias_score_v2(st.bids, st.asks, st.mid, st.trades, st.klines)
         # Store details for debugging
         st.score_v2_details = details
+        st.score_v2_direction = details.get('direction', 'NEUTRAL')
+        # Temporary debug: log why score=0
+        if score == 0 and details.get('fail_reason'):
+            import time
+            if not hasattr(calculate_trend_score, '_last_debug') or time.time() - calculate_trend_score._last_debug > 60:
+                calculate_trend_score._last_debug = time.time()
+                print(f"[V2_DEBUG] Score=0 reason: {details['fail_reason']} | dir={details.get('direction')} | filters={details.get('hard_filters')}", flush=True)
         return score  # Already 0-100
     else:
         score_val, label, _ = _score_trend(st)
